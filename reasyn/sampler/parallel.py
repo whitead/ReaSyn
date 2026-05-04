@@ -15,25 +15,18 @@
 
 import multiprocessing as mp
 mp.set_start_method('spawn', force=True)
-import os
 import pathlib
-import pickle
 import subprocess
 from multiprocessing import synchronize as sync
 from typing import TypeAlias
 import time
 
-import numpy as np
 import pandas as pd
-import torch
-from omegaconf import OmegaConf
 from tqdm.auto import tqdm
 
 from reasyn.sampler.sampler import Sampler
-from reasyn.chem.fpindex import FingerprintIndex
-from reasyn.chem.matrix import ReactantReactionMatrix
-from reasyn.chem.mol import FingerprintOption, Molecule
-from reasyn.models.reasyn import ReaSyn
+from reasyn.chem.mol import Molecule
+from reasyn.sampler.runtime import PathLike, load_sampling_runtime, set_process_affinity_to_all_cpus
 from reasyn.utils.sample_utils import TimeLimit
 
 import warnings
@@ -63,7 +56,8 @@ class Worker(mp.Process):
         num_editflow_samples: int = 10,
         num_editflow_steps: int = 100,
         mols_to_filter = None,
-        filter_sim: float = 0.8
+        filter_sim: float = 0.8,
+        asset_dir: PathLike | None = None,
     ):
         super().__init__()
         self._model_path = model_path
@@ -84,31 +78,23 @@ class Worker(mp.Process):
         self.num_editflow_steps = num_editflow_steps
         self.mols_to_filter = mols_to_filter
         self.filter_sim = filter_sim
+        self.asset_dir = asset_dir
 
     def run(self) -> None:
-        os.sched_setaffinity(0, range(os.cpu_count() or 1))
+        set_process_affinity_to_all_cpus()
         
         assert isinstance(self._model_path, list) and len(self._model_path) == 2
-    
-        self._model = []
-        for _model_path in self._model_path:
-            ckpt = torch.load(_model_path, map_location="cpu")
-            config = OmegaConf.create(ckpt["hyper_parameters"]["config"])
-            _model = ReaSyn(config.model).to(f"cuda:{self._gpu_id}")
-            _model.load_state_dict({k[6:]: v for k, v in ckpt["state_dict"].items()})
-            _model.eval()
-            self._model.append(_model)
-        
-        self._fpindex: FingerprintIndex = pickle.load(open(config.chem.fpindex, "rb"))
-        self._rxn_matrix: ReactantReactionMatrix = pickle.load(open(config.chem.rxn_matrix, "rb"))
-        if self.add_bb_path:
-            _fpindex_add = pickle.load(open(self.add_bb_path, "rb"))
-            num_orig_bb = len(self._fpindex._molecules)
-            self._fpindex._molecules += _fpindex_add._molecules
-            self._fpindex._smiles += _fpindex_add._smiles
-            self._fpindex._fp = np.vstack([self._fpindex._fp, _fpindex_add._fp])
-            if self.verbose:
-                print(f'BB expanded: {num_orig_bb} -> {len(self._fpindex._molecules)}')
+
+        runtime = load_sampling_runtime(
+            self._model_path,
+            device=f"cuda:{self._gpu_id}",
+            asset_dir=self.asset_dir,
+            add_bb_path=self.add_bb_path,
+            verbose=self.verbose,
+        )
+        self._model = runtime.models
+        self._fpindex = runtime.fpindex
+        self._rxn_matrix = runtime.rxn_matrix
 
         while True:
             next_task = self._task_queue.get()
@@ -230,7 +216,8 @@ def run_parallel_sampling(
     num_editflow_samples: int = 10,
     num_editflow_steps: int = 100,
     mols_to_filter = None,
-    filter_sim: float = 0.8
+    filter_sim: float = 0.8,
+    asset_dir: PathLike | None = None,
 ) -> None:
     num_gpus = num_gpus if num_gpus > 0 else _count_gpus()
     
@@ -253,7 +240,8 @@ def run_parallel_sampling(
         num_editflow_samples=num_editflow_samples,
         num_editflow_steps=num_editflow_steps,
         mols_to_filter=mols_to_filter,
-        filter_sim=filter_sim
+        filter_sim=filter_sim,
+        asset_dir=asset_dir,
     )
     output.parent.mkdir(parents=True, exist_ok=True)
 
@@ -307,7 +295,8 @@ def run_parallel_sampling_return_smiles(
     num_editflow_samples: int = 10,
     num_editflow_steps: int = 100,
     mols_to_filter=None,
-    filter_sim: float = 0.8
+    filter_sim: float = 0.8,
+    asset_dir: PathLike | None = None,
 ) -> None:
     num_gpus = num_gpus if num_gpus > 0 else _count_gpus()
     
@@ -329,7 +318,8 @@ def run_parallel_sampling_return_smiles(
         exact_break=True,
         num_cycles=num_cycles,
         num_editflow_samples=num_editflow_samples,
-        num_editflow_steps=num_editflow_steps
+        num_editflow_steps=num_editflow_steps,
+        asset_dir=asset_dir,
     )
 
     total = len(input)
@@ -352,7 +342,7 @@ def run_parallel_sampling_return_smiles(
 
 def run_sampling_one(
     input: Molecule,
-    model_path: pathlib.Path | list[pathlib.Path, pathlib.Path],
+    model_path: str | pathlib.Path | list[pathlib.Path],
     search_width: int = 24,
     exhaustiveness: int = 64,
     max_evolve_steps: int = 8,
@@ -364,19 +354,16 @@ def run_sampling_one(
     num_editflow_samples: int = 10,
     num_editflow_steps: int = 100,
     mols_to_filter=None,
-    filter_sim=0.8
+    filter_sim=0.8,
+    asset_dir: PathLike | None = None,
 ) -> pd.DataFrame:
-
-    assert isinstance(model_path, list) and len(model_path) == 2
-    
-    model = []
-    for _model_path in model_path:
-        ckpt = torch.load(_model_path, map_location="cpu")
-        config = OmegaConf.create(ckpt["hyper_parameters"]["config"])
-        _model = ReaSyn(config.model).to(device)
-        _model.load_state_dict({k[6:]: v for k, v in ckpt["state_dict"].items()})
-        _model.eval()
-        model.append(_model)
+    runtime = load_sampling_runtime(
+        model_path,
+        device=device,
+        asset_dir=asset_dir,
+        add_bb_path=add_bb_path,
+    )
+    model = runtime.models
     
     sampler_opt={
         "factor": search_width,
@@ -385,19 +372,9 @@ def run_sampling_one(
         "filter_sim": filter_sim
     }
 
-    _fpindex: FingerprintIndex = pickle.load(open(config.chem.fpindex, "rb"))
-    _rxn_matrix: ReactantReactionMatrix = pickle.load(open(config.chem.rxn_matrix, "rb"))
-    if add_bb_path:
-        _fpindex_add = pickle.load(open(add_bb_path, "rb"))
-        num_orig_bb = len(_fpindex._molecules)
-        _fpindex._molecules += _fpindex_add._molecules
-        _fpindex._smiles += _fpindex_add._smiles
-        _fpindex._fp = np.vstack([_fpindex._fp, _fpindex_add._fp])
-        print(f'BB expanded: {num_orig_bb} -> {len(_fpindex._molecules)}')
-    
     sampler = Sampler(
-        fpindex=_fpindex,
-        rxn_matrix=_rxn_matrix,
+        fpindex=runtime.fpindex,
+        rxn_matrix=runtime.rxn_matrix,
         mol=input,
         model=model,
         **sampler_opt,

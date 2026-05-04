@@ -1,0 +1,14 @@
+.git
+.venv
+__pycache__
+*.pyc
+.DS_Store
+logs
+results
+tmp*
+oracle
+*.ckpt
+data/edit_bridge
+data/processed
+data/trained_model
+mcule_unique_bb_instock_library_260130.csv

@@ -45,7 +45,8 @@ def _fill_fingerprint(
     molecules: Iterable[Molecule],
     fp_option: FingerprintOption,
 ):
-    os.sched_setaffinity(0, range(os.cpu_count() or 1))
+    if hasattr(os, "sched_setaffinity"):
+        os.sched_setaffinity(0, range(os.cpu_count() or 1))
     for i, mol in enumerate(molecules):
         fp[offset + i] = mol.get_fingerprint(fp_option).astype(np.uint8)
 
@@ -84,6 +85,17 @@ class FingerprintIndex:
         self._fp = self._init_fingerprint()
         self._tree = self._init_tree()
 
+    def __getstate__(self):
+        state = self.__dict__.copy()
+        # The sampler uses query_cuda for inference. Avoid pickling the large
+        # CPU BallTree; rebuild it lazily only if query() is called.
+        state["_tree"] = None
+        return state
+
+    def __setstate__(self, state):
+        self.__dict__.update(state)
+        self.__dict__.setdefault("_tree", None)
+
     @property
     def molecules(self) -> tuple[Molecule, ...]:
         return self._molecules
@@ -111,6 +123,8 @@ class FingerprintIndex:
         Args:
             q: shape (bsz, ..., fp_dim)
         """
+        if self._tree is None:
+            self._tree = self._init_tree()
         bsz = q.shape[0]
         dist, idx = self._tree.query(q.reshape([-1, self._fp_option.dim]), k=k)
         dist = dist.reshape([bsz, -1])

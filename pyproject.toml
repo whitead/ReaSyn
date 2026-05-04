@@ -1,32 +1,69 @@
-[tool.poetry]
+[project]
 name = "reasyn"
 version = "0.1.0"
-description = "ReaSyn code"
-authors = ["NVIDIA corp"]
-license = "Apache 2.0"
+description = "Inference-focused packaging for the ReaSyn retrosynthesis model."
 readme = "README.md"
+requires-python = ">=3.10,<3.12"
+license = { text = "Apache-2.0" }
+authors = [{ name = "NVIDIA Corporation" }]
+dependencies = [
+    "click==8.2.1",
+    "editdistance==0.8.1",
+    "einops>=0.8.0,<0.9",
+    "joblib>=1.4,<2",
+    "numpy==1.26.4",
+    "omegaconf==2.3.0",
+    "pandas==2.3.1",
+    "pyyaml==6.0.2",
+    "rdkit==2025.3.2",
+    "rotary-embedding-torch>=0.8.6,<1",
+    "scikit-learn==1.2.2",
+    "torch==2.7.0",
+    "torchtyping==0.1.5",
+    "tqdm==4.67.1",
+]
 
-[tool.poetry.dependencies]
-python = "3.10.17"
-pip = "25.1"
-omegaconf = "2.3.0"
-torch = "2.7.0"
-transformers = "4.53.2"
-wandb = "0.19.11"
-pandas = "2.3.1"
-click = "8.2.1"
-tqdm = "4.67.1"
-mypy = "1.15.0"
-pyyaml = "6.0.2"
-datasets = "4.0.0"
-pytdc = "0.4.1"
-pytorch-lightning = "2.5.3"
-rdkit = "2025.3.2"
-numpy = "1.26.4"
-scikit-learn = "1.2.2"
-editdistance = "0.8.1"
-torchtyping = "0.1.5"
+[project.optional-dependencies]
+eval = [
+    "pytdc==0.4.1",
+]
+modal = [
+    "fastapi[standard]>=0.115,<1",
+    "modal>=1.1,<2",
+]
+train = [
+    "datasets==4.0.0",
+    "pytorch-lightning==2.5.3",
+    "wandb==0.19.11",
+]
+
+[project.scripts]
+reasyn-sample = "reasyn.cli.sample:main"
+reasyn-sample-one = "reasyn.cli.sample_one:main"
+reasyn-preprocess = "reasyn.cli.preprocess:main"
+reasyn-prepare-mcule-building-blocks = "reasyn.cli.prepare_mcule_building_blocks:main"
+
+[dependency-groups]
+dev = [
+    "black>=25.1,<26",
+    "flake8>=7.1,<8",
+    "isort>=6,<7",
+    "mypy==1.15.0",
+    "pre-commit>=4,<5",
+    "pytest>=8,<9",
+    "rich>=14,<15",
+    "sphinx>=8,<9",
+    "sphinx-rtd-theme>=3,<4",
+    "types-pyyaml>=6.0.12,<7",
+]
 
 [build-system]
-requires = ["poetry-core"]
-build-backend = "poetry.core.masonry.api"
+requires = ["hatchling>=1.27"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["reasyn"]
+
+[tool.uv]
+package = true
+default-groups = []

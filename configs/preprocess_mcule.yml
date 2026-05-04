@@ -1,0 +1,9 @@
+chem:
+  fp_option:
+    type: morgan
+    morgan_radius: 2
+    morgan_n_bits: 2048
+  building_block_path: data/building_blocks/building_blocks_mcule.txt
+  reaction_path: data/rxn_templates/comprehensive.txt
+  rxn_matrix: data/processed/mcule_2048/matrix.pkl
+  fpindex: data/processed/mcule_2048/fpindex.pkl

@@ -37,10 +37,146 @@ Find the Model Card++ for ReaSyn [here](model_card/overview.md).
 
 ## Installation
 
-Run the following command to install dependencies:
+For inference-focused development, use `uv`:
+```bash
+uv sync --group dev
+```
+
+This installs the default inference dependencies. Training and benchmark-only
+dependencies are optional:
+```bash
+uv sync --extra train --extra eval --group dev
+```
+
+The packaged command line entry points are:
+```bash
+uv run reasyn-sample --help
+uv run reasyn-sample-one --help
+uv run reasyn-preprocess --help
+uv run reasyn-prepare-mcule-building-blocks --help
+```
+
+The original Conda environment is retained for reference:
 ```bash
 conda env create -f env.yml
 conda activate reasyn
+```
+
+## Inference Runtime Assets
+
+Inference needs these runtime assets, which are not committed to this repository:
+
+- `data/trained_model/nv-reasyn-ar-166m-v2.ckpt`
+- `data/trained_model/nv-reasyn-eb-174m-v2.ckpt`
+- `data/processed/comp_2048/fpindex.pkl`
+- `data/processed/comp_2048/matrix.pkl`
+
+Checkpoint configs refer to the processed chemistry files using relative paths.
+For Docker or Modal volume mounts, pass `--asset-dir` to resolve those paths
+under the mounted asset root.
+
+Example batch inference:
+```bash
+uv run reasyn-sample \
+  --asset-dir . \
+  -m data/trained_model/nv-reasyn-ar-166m-v2.ckpt,data/trained_model/nv-reasyn-eb-174m-v2.ckpt \
+  -i data/test_zinc250k.txt \
+  -o results/zinc250k.csv \
+  --num-cycles 16
+```
+
+Example single-molecule inference:
+```bash
+uv run reasyn-sample-one \
+  --asset-dir . \
+  -m data/trained_model/nv-reasyn-ar-166m-v2.ckpt,data/trained_model/nv-reasyn-eb-174m-v2.ckpt \
+  -s 'O=C(Nc1ccc(F)cc1)N(Cc1noc(C2CC2)n1)c1ccc(Cl)cc1Cl'
+```
+
+### MCule Building Blocks
+
+The MCule CSV in this checkout is raw supplier data. ReaSyn's `--add-bb-path`
+expects a pickled `FingerprintIndex`, not a CSV. Prepare it with:
+```bash
+uv run reasyn-prepare-mcule-building-blocks --force
+```
+
+By default this reads `mcule_unique_bb_instock_library_260130.csv`, extracts
+zero-based column `5` as SMILES, writes canonical SMILES to
+`data/building_blocks/building_blocks_mcule.txt`, writes the MCule
+building-block index to `data/processed/mcule_2048/fpindex.pkl`, and writes
+the MCule reaction matrix to `data/processed/mcule_2048/matrix.pkl`.
+
+Use it during inference with:
+```bash
+uv run reasyn-sample-one \
+  --asset-dir . \
+  --add-bb-path data/processed/mcule_2048/fpindex.pkl \
+  -m data/trained_model/nv-reasyn-ar-166m-v2.ckpt,data/trained_model/nv-reasyn-eb-174m-v2.ckpt \
+  -s 'CCO'
+```
+
+### Docker
+
+Build the image:
+```bash
+docker build -t reasyn .
+```
+
+Run with model and chemistry assets mounted into `/app/data`:
+```bash
+docker run --rm --gpus all \
+  -v "$PWD/data:/app/data" \
+  reasyn \
+  --asset-dir /app \
+  -m data/trained_model/nv-reasyn-ar-166m-v2.ckpt,data/trained_model/nv-reasyn-eb-174m-v2.ckpt \
+  -i data/test_zinc250k.txt \
+  -o results/zinc250k.csv
+```
+
+### Modal
+
+The Modal app is in `modal_app.py`. It exposes an authenticated FastAPI POST
+endpoint and a GPU worker with Modal dynamic batching. Each request takes one
+or more input molecules and returns one result object per input molecule, with
+up to `k` routes per molecule.
+
+Auth uses a Modal Secret named `reasyn-web-auth` containing
+`REASYN_AUTH_TOKEN`. Requests must include:
+```text
+Authorization: Bearer <token>
+```
+
+Create or rotate the token:
+```bash
+modal secret create reasyn-web-auth REASYN_AUTH_TOKEN="$(openssl rand -hex 32)" --force
+```
+
+The app expects a Modal Volume named `reasyn-assets` mounted at `/vol`, with
+assets under `/vol/reasyn`. One-time setup:
+```bash
+modal volume create reasyn-assets
+modal volume put reasyn-assets data/processed/mcule_2048 /reasyn/data/processed/mcule_2048 -f
+uv run --extra modal modal run modal_app.py::hydrate
+```
+
+Deploy:
+```bash
+uv run --extra modal modal deploy modal_app.py --name reasyn
+```
+
+Example request:
+```bash
+curl -X POST https://edisonscientific--reasyn-routes.modal.run \
+  -H "Content-Type: application/json" \
+  -H "Authorization: Bearer $REASYN_AUTH_TOKEN" \
+  -d '{
+    "smiles": ["CCO", "c1ccccc1"],
+    "k": 2,
+    "search_width": 1,
+    "exhaustiveness": 1,
+    "num_cycles": 1
+  }'
 ```
 
 ## Data Preparation
@@ -134,7 +270,7 @@ python scripts/sample.py -m ${model_path} -i ${testset_path} -o ${output_path} -
 # python scripts/sample.py -m ${model_path} -i data/test_zinc250k.txt -o results/zinc250k.txt --num_cycles 16 --add_bb_path data/processed/zinc250k_2048/fpindex.pkl
 python scripts/eval_recon.py ${output_path}
 ```
-`model_path` is a comma-separated string of the AR and EB model paths, e.g., `data/trained_model/nv-reasyn-ar-166m-v2.ckpt,data/trained_model/nv-reasyn-eb-174b-v2.ckpt`.<br>
+`model_path` is a comma-separated string of the AR and EB model paths, e.g., `data/trained_model/nv-reasyn-ar-166m-v2.ckpt,data/trained_model/nv-reasyn-eb-174m-v2.ckpt`.<br>
 We recommend using multiple GPUs for parallelized synthesizable molecule reconstruction.
 
 ### Synthesizable Goal-directed Optimization of TDC Oracles
@@ -142,7 +278,7 @@ Run the following command to conduct synthesizable goal-directed optimization of
 ```bash
 python scripts/optimize_tdc.py -m ${model_path} -o ${oracle}
 ```
-`model_path` is a comma-separated string of the AR and EB model paths, e.g., `data/trained_model/nv-reasyn-ar-166m-v2.ckpt,data/trained_model/nv-reasyn-eb-174b-v2.ckpt`.
+`model_path` is a comma-separated string of the AR and EB model paths, e.g., `data/trained_model/nv-reasyn-ar-166m-v2.ckpt,data/trained_model/nv-reasyn-eb-174m-v2.ckpt`.
 
 ### Synthesizable Hit Expansion
 Run the following command to conduct synthesizable hit expansion:
@@ -150,7 +286,7 @@ Run the following command to conduct synthesizable hit expansion:
 python scripts/sample.py -m ${model_path} -i data/jnk3_hit.txt -o ${output_path} --search_width 12 --exhaustiveness 128 --num_cycles 12 --no_exact_break
 python scripts/eval_hit.py ${output_path}
 ```
-`model_path` is a comma-separated string of the AR and EB model paths, e.g., `data/trained_model/nv-reasyn-ar-166m-v2.ckpt,data/trained_model/nv-reasyn-eb-174b-v2.ckpt`.
+`model_path` is a comma-separated string of the AR and EB model paths, e.g., `data/trained_model/nv-reasyn-ar-166m-v2.ckpt,data/trained_model/nv-reasyn-eb-174m-v2.ckpt`.
 
 ### (Optional) Filtering Pathways
 We additionally provide the functionality to filter out generated pathways that lead to molecules that users want to avoid (e.g., toxic molecules). We provide an example catalog of toxic molecules in `data/mols_to_filter.txt`. Set `mols_to_filter` and `filter_sim` arguments to filter synthetic pathways for molecules whose Tanimoto similarity to `mols_to_filter` is greater than `filter_sim`.<br>

@@ -44,7 +44,7 @@ class Sampler:
         fpindex: FingerprintIndex,
         rxn_matrix: ReactantReactionMatrix,
         mol: Molecule,
-        model: list[ReaSyn, ReaSyn],
+        model: list[ReaSyn],
         factor: int = 16,
         max_active_states: int = 256,
         exact_break: bool = True,
