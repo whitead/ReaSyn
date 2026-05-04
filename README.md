@@ -134,52 +134,89 @@ docker run --rm --gpus all \
   -o results/zinc250k.csv
 ```
 
-### Modal
+### Modal Integration
 
-The Modal app is in `modal_app.py`. It exposes an authenticated FastAPI POST
-endpoint and a GPU worker with Modal dynamic batching. Each request takes one
-or more input molecules and returns one result object per input molecule, with
-up to `k` routes per molecule. The public search controls are intentionally
-small: `effort` is one of `low`, `medium`, or `high`, and `verbose` controls the
-response shape.
+`modal_app.py` contains a deployable Modal app with two separable parts:
 
-With `verbose=false`, each route is just a list of RDKit-forward reaction
-SMILES. With `verbose=true`, each route also includes the generated molecule,
-scores, effective search preset, `forward_valid`, `forward_error`,
-`forward_candidate_count`, and `forward_steps`.
+- `ReaSynService`: the GPU worker that loads checkpoints, MCule assets, runs
+  inference, validates routes by forward-executing RDKit reactions, and uses
+  Modal dynamic batching.
+- `routes`: a small FastAPI HTTP endpoint with bearer-token auth. This is a
+  convenience wrapper around `ReaSynService`, not a requirement.
 
-The GPU worker keeps a short per-container cache for `(smiles, k, effort)` so a
-client can first request compact output and then re-request the same inputs with
-`verbose=true` to get details without rerunning inference when the request lands
-on the same warm worker. `verbose` is intentionally not part of the cache key.
+The public request schema is intentionally small:
 
-Auth uses a Modal Secret named `reasyn-web-auth` containing
-`REASYN_AUTH_TOKEN`. Requests must include:
-```text
-Authorization: Bearer <token>
+```json
+{
+  "smiles": ["CCO", "c1ccccc1"],
+  "k": 2,
+  "effort": "low",
+  "verbose": false
+}
 ```
 
-Create or rotate the token:
+`effort` must be `low`, `medium`, or `high`. `verbose=false` returns only
+RDKit-forward reaction SMILES for each route. `verbose=true` also returns the
+generated molecule, scores, effective search preset, `forward_valid`,
+`forward_error`, `forward_candidate_count`, and `forward_steps`.
+
+The GPU worker keeps a short per-container cache for `(smiles, k, effort)`.
+`verbose` is intentionally not part of the cache key, so a client can first
+request compact output and then re-request the same inputs with `verbose=true`
+to get details without rerunning inference when the request lands on the same
+warm worker.
+
+#### Deploy The Included Endpoint
+
+Install Modal support and authenticate:
+
 ```bash
-modal secret create reasyn-web-auth REASYN_AUTH_TOKEN="$(openssl rand -hex 32)" --force
+uv sync --extra modal
+uv run --extra modal modal setup
 ```
 
-The app expects a Modal Volume named `reasyn-assets` mounted at `/vol`, with
-assets under `/vol/reasyn`. One-time setup:
+Prepare the MCule runtime assets locally:
+
 ```bash
-modal volume create reasyn-assets
-modal volume put reasyn-assets data/processed/mcule_2048 /reasyn/data/processed/mcule_2048 -f
+uv run reasyn-prepare-mcule-building-blocks --force
+```
+
+Create the Modal volume and upload the MCule assets:
+
+```bash
+uv run --extra modal modal volume create reasyn-assets
+uv run --extra modal modal volume put reasyn-assets \
+  data/processed/mcule_2048 \
+  /reasyn/data/processed/mcule_2048 \
+  -f
+```
+
+Hydrate model checkpoints into the same volume. This downloads the NVIDIA
+ReaSyn checkpoints from Hugging Face inside Modal:
+
+```bash
 uv run --extra modal modal run modal_app.py::hydrate
 ```
 
+Create or rotate the bearer-token secret used by the included endpoint:
+
+```bash
+export REASYN_AUTH_TOKEN="$(openssl rand -hex 32)"
+uv run --extra modal modal secret create reasyn-web-auth \
+  REASYN_AUTH_TOKEN="$REASYN_AUTH_TOKEN" \
+  --force
+```
+
 Deploy:
+
 ```bash
 uv run --extra modal modal deploy modal_app.py --name reasyn
 ```
 
-Example request:
+Test:
+
 ```bash
-curl -X POST https://edisonscientific--reasyn-routes.modal.run \
+curl -X POST https://<workspace>--reasyn-routes.modal.run \
   -H "Content-Type: application/json" \
   -H "Authorization: Bearer $REASYN_AUTH_TOKEN" \
   -d '{
@@ -189,6 +226,56 @@ curl -X POST https://edisonscientific--reasyn-routes.modal.run \
     "verbose": false
   }'
 ```
+
+#### Bring Your Own FastAPI/Auth
+
+If you already have server logic, keep `ReaSynService` and replace or ignore the
+included `routes` function. Your own Modal web function can call the same
+batched GPU worker:
+
+```python
+import modal
+from fastapi import Header, HTTPException
+
+from modal_app import ReaSynService, RoutesRequest, RoutesResponse, app, web_image
+
+
+@app.function(image=web_image, secrets=[modal.Secret.from_name("your-secret")])
+@modal.fastapi_endpoint(method="POST", label="your-routes")
+def your_routes(request: RoutesRequest, authorization: str | None = Header(default=None)) -> RoutesResponse:
+    # Apply your own API keys, JWTs, tenant checks, rate limits, logging, etc.
+    if not your_auth_check(authorization):
+        raise HTTPException(status_code=401, detail="Unauthorized")
+
+    return RoutesResponse.model_validate(
+        ReaSynService().sample_many.remote(request.model_dump())
+    )
+```
+
+For a non-Modal API server, deploy only the Modal worker app and call the remote
+method from your service process:
+
+```python
+from modal_app import ReaSynService
+
+payload = {
+    "smiles": ["CCO", "c1ccccc1"],
+    "k": 2,
+    "effort": "medium",
+    "verbose": True,
+}
+result = ReaSynService().sample_many.remote(payload)
+```
+
+Keep these constraints in mind when bringing your own server:
+
+- The worker expects assets in Modal volume `reasyn-assets` under `/vol/reasyn`.
+- `sample_many` accepts a list of request dictionaries because it is dynamically
+  batched by Modal; each dictionary uses the same schema as the HTTP endpoint.
+- Leave batching on the worker side. Your server can send one request per user
+  call; Modal coalesces concurrent calls up to `BATCH_MAX_REQUESTS`.
+- If you change auth or request models, keep `RoutesRequest` compatible or add
+  an adapter before calling `sample_many.remote(...)`.
 
 ## Data Preparation
 
