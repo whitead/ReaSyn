@@ -137,6 +137,8 @@ class ReaSynService:
         return RoutesResponse(results=results).model_dump()
 
     def _sample_one(self, smiles: str, request: RoutesRequest) -> MoleculeRoutes:
+        from reasyn.validation import validate_route_forward
+
         try:
             df = self.engine.sample(
                 smiles,
@@ -153,7 +155,30 @@ class ReaSynService:
 
         routes = []
         for rank, row in enumerate(df.head(request.k).to_dict(orient="records"), start=1):
-            routes.append({"rank": rank, **{key: _jsonable(value) for key, value in row.items()}})
+            validation = validate_route_forward(
+                synthesis=str(row["synthesis"]),
+                expected_product=str(row["smiles"]),
+                reactions=self.engine.runtime.rxn_matrix.reactions,
+            )
+            routes.append(
+                {
+                    "rank": rank,
+                    **{key: _jsonable(value) for key, value in row.items()},
+                    "forward_valid": validation.valid,
+                    "forward_error": validation.error,
+                    "forward_candidate_count": validation.final_candidate_count,
+                    "forward_steps": [
+                        {
+                            "rxn_id": step.rxn_id,
+                            "reactants": step.reactants,
+                            "product": step.product,
+                            "reaction_smiles": step.reaction_smiles,
+                            "reaction_smarts": step.reaction_smarts,
+                        }
+                        for step in validation.steps
+                    ],
+                }
+            )
         return MoleculeRoutes(input=smiles, routes=routes)
 
 

@@ -139,7 +139,9 @@ docker run --rm --gpus all \
 The Modal app is in `modal_app.py`. It exposes an authenticated FastAPI POST
 endpoint and a GPU worker with Modal dynamic batching. Each request takes one
 or more input molecules and returns one result object per input molecule, with
-up to `k` routes per molecule.
+up to `k` routes per molecule. Each route also includes `forward_valid`,
+`forward_error`, `forward_candidate_count`, and `forward_steps`, produced by
+forward-executing the route's reaction templates in RDKit.
 
 Auth uses a Modal Secret named `reasyn-web-auth` containing
 `REASYN_AUTH_TOKEN`. Requests must include:
