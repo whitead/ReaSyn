@@ -139,9 +139,19 @@ docker run --rm --gpus all \
 The Modal app is in `modal_app.py`. It exposes an authenticated FastAPI POST
 endpoint and a GPU worker with Modal dynamic batching. Each request takes one
 or more input molecules and returns one result object per input molecule, with
-up to `k` routes per molecule. Each route also includes `forward_valid`,
-`forward_error`, `forward_candidate_count`, and `forward_steps`, produced by
-forward-executing the route's reaction templates in RDKit.
+up to `k` routes per molecule. The public search controls are intentionally
+small: `effort` is one of `low`, `medium`, or `high`, and `verbose` controls the
+response shape.
+
+With `verbose=false`, each route is just a list of RDKit-forward reaction
+SMILES. With `verbose=true`, each route also includes the generated molecule,
+scores, effective search preset, `forward_valid`, `forward_error`,
+`forward_candidate_count`, and `forward_steps`.
+
+The GPU worker keeps a short per-container cache for `(smiles, k, effort)` so a
+client can first request compact output and then re-request the same inputs with
+`verbose=true` to get details without rerunning inference when the request lands
+on the same warm worker. `verbose` is intentionally not part of the cache key.
 
 Auth uses a Modal Secret named `reasyn-web-auth` containing
 `REASYN_AUTH_TOKEN`. Requests must include:
@@ -175,9 +185,8 @@ curl -X POST https://edisonscientific--reasyn-routes.modal.run \
   -d '{
     "smiles": ["CCO", "c1ccccc1"],
     "k": 2,
-    "search_width": 1,
-    "exhaustiveness": 1,
-    "num_cycles": 1
+    "effort": "low",
+    "verbose": false
   }'
 ```
 

@@ -4,11 +4,12 @@ import hmac
 import os
 import pathlib
 import shutil
-from typing import Any
+import time
+from typing import Any, Literal
 
 import modal
 from fastapi import Header, HTTPException, status
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, ConfigDict, Field
 
 
 APP_NAME = "reasyn"
@@ -24,22 +25,51 @@ MCULE_MATRIX = ASSET_DIR / "data/processed/mcule_2048/matrix.pkl"
 
 BATCH_MAX_REQUESTS = 4
 BATCH_WAIT_MS = 750
+CACHE_TTL_SECONDS = 5 * 60
+CACHE_MAX_ITEMS = 256
+
+Effort = Literal["low", "medium", "high"]
+
+EFFORT_PRESETS: dict[Effort, dict[str, int]] = {
+    "low": {
+        "search_width": 2,
+        "exhaustiveness": 4,
+        "num_cycles": 1,
+        "num_editflow_samples": 5,
+        "num_editflow_steps": 25,
+        "time_limit": 120,
+    },
+    "medium": {
+        "search_width": 4,
+        "exhaustiveness": 8,
+        "num_cycles": 2,
+        "num_editflow_samples": 10,
+        "num_editflow_steps": 50,
+        "time_limit": 300,
+    },
+    "high": {
+        "search_width": 8,
+        "exhaustiveness": 32,
+        "num_cycles": 4,
+        "num_editflow_samples": 25,
+        "num_editflow_steps": 100,
+        "time_limit": 600,
+    },
+}
 
 
 class RoutesRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
     smiles: list[str] = Field(..., min_length=1)
     k: int = Field(default=10, ge=1, le=100)
-    search_width: int = Field(default=8, ge=1)
-    exhaustiveness: int = Field(default=16, ge=1)
-    num_cycles: int = Field(default=2, ge=1)
-    num_editflow_samples: int = Field(default=25, ge=1)
-    num_editflow_steps: int = Field(default=50, ge=1)
-    time_limit: int = Field(default=300, ge=0)
+    effort: Effort = "medium"
+    verbose: bool = False
 
 
 class MoleculeRoutes(BaseModel):
     input: str
-    routes: list[dict[str, Any]]
+    routes: list[Any]
     error: str | None = None
 
 
@@ -99,6 +129,10 @@ def _jsonable(value: Any) -> Any:
     return value
 
 
+def _compact_routes(routes: list[dict[str, Any]]) -> list[list[str]]:
+    return [route["reaction_smiles"] for route in routes]
+
+
 @app.cls(
     image=worker_image,
     gpu="A10G",
@@ -123,9 +157,11 @@ class ReaSynService:
             rxn_matrix_path=MCULE_MATRIX,
             device="cuda",
         )
+        self._route_cache: dict[tuple[str, int, str], tuple[float, list[dict[str, Any]]]] = {}
 
     @modal.batched(max_batch_size=BATCH_MAX_REQUESTS, wait_ms=BATCH_WAIT_MS)
     def sample_many(self, requests: list[dict[str, Any]]) -> list[dict[str, Any]]:
+        self._last_batch_size = len(requests)
         return [self._sample_payload(request) for request in requests]
 
     def _sample_payload(self, request: dict[str, Any]) -> dict[str, Any]:
@@ -137,21 +173,48 @@ class ReaSynService:
         return RoutesResponse(results=results).model_dump()
 
     def _sample_one(self, smiles: str, request: RoutesRequest) -> MoleculeRoutes:
-        from reasyn.validation import validate_route_forward
-
         try:
-            df = self.engine.sample(
-                smiles,
-                search_width=request.search_width,
-                exhaustiveness=request.exhaustiveness,
-                max_results=request.k,
-                time_limit=request.time_limit,
-                num_cycles=request.num_cycles,
-                num_editflow_samples=request.num_editflow_samples,
-                num_editflow_steps=request.num_editflow_steps,
-            )
+            routes, cache_hit = self._get_or_sample_routes(smiles, request)
         except Exception as exc:
             return MoleculeRoutes(input=smiles, routes=[], error=str(exc))
+
+        if not request.verbose:
+            return MoleculeRoutes(input=smiles, routes=_compact_routes(routes))
+
+        for route in routes:
+            route["search"]["cache_hit"] = cache_hit
+        return MoleculeRoutes(input=smiles, routes=routes)
+
+    def _get_or_sample_routes(self, smiles: str, request: RoutesRequest) -> tuple[list[dict[str, Any]], bool]:
+        cache_key = (smiles, request.k, request.effort)
+        now = time.time()
+        cached = self._route_cache.get(cache_key)
+        if cached is not None:
+            expires_at, routes = cached
+            if expires_at > now:
+                return [self._copy_route(route) for route in routes], True
+            del self._route_cache[cache_key]
+
+        routes = self._sample_routes(smiles, request)
+        self._route_cache[cache_key] = (now + CACHE_TTL_SECONDS, [self._copy_route(route) for route in routes])
+        if len(self._route_cache) > CACHE_MAX_ITEMS:
+            self._evict_expired_or_oldest_cache_entry()
+        return routes, False
+
+    def _sample_routes(self, smiles: str, request: RoutesRequest) -> list[dict[str, Any]]:
+        from reasyn.validation import validate_route_forward
+
+        preset = EFFORT_PRESETS[request.effort]
+        df = self.engine.sample(
+            smiles,
+            search_width=preset["search_width"],
+            exhaustiveness=preset["exhaustiveness"],
+            max_results=request.k,
+            time_limit=preset["time_limit"],
+            num_cycles=preset["num_cycles"],
+            num_editflow_samples=preset["num_editflow_samples"],
+            num_editflow_steps=preset["num_editflow_steps"],
+        )
 
         routes = []
         for rank, row in enumerate(df.head(request.k).to_dict(orient="records"), start=1):
@@ -160,9 +223,18 @@ class ReaSynService:
                 expected_product=str(row["smiles"]),
                 reactions=self.engine.runtime.rxn_matrix.reactions,
             )
+            reaction_smiles = [step.reaction_smiles for step in validation.steps]
             routes.append(
                 {
                     "rank": rank,
+                    "reaction_smiles": reaction_smiles,
+                    "effort": request.effort,
+                    "search": {
+                        **preset,
+                        "modal_request_batch_size": getattr(self, "_last_batch_size", 1),
+                        "cache_hit": False,
+                        "cache_ttl_seconds": CACHE_TTL_SECONDS,
+                    },
                     **{key: _jsonable(value) for key, value in row.items()},
                     "forward_valid": validation.valid,
                     "forward_error": validation.error,
@@ -179,7 +251,30 @@ class ReaSynService:
                     ],
                 }
             )
-        return MoleculeRoutes(input=smiles, routes=routes)
+        return routes
+
+    def _evict_expired_or_oldest_cache_entry(self) -> None:
+        now = time.time()
+        for key, (expires_at, _) in list(self._route_cache.items()):
+            if expires_at <= now:
+                del self._route_cache[key]
+        if len(self._route_cache) <= CACHE_MAX_ITEMS:
+            return
+
+        oldest_key = min(self._route_cache, key=lambda key: self._route_cache[key][0])
+        del self._route_cache[oldest_key]
+
+    @staticmethod
+    def _copy_route(route: dict[str, Any]) -> dict[str, Any]:
+        copied = {}
+        for key, value in route.items():
+            if isinstance(value, dict):
+                copied[key] = value.copy()
+            elif isinstance(value, list):
+                copied[key] = [item.copy() if isinstance(item, dict) else item for item in value]
+            else:
+                copied[key] = value
+        return copied
 
 
 @app.function(
@@ -223,16 +318,14 @@ def routes(request: RoutesRequest, authorization: str | None = Header(default=No
 def main(
     smiles: str = "O=C(Nc1ccc(F)cc1)N(Cc1noc(C2CC2)n1)c1ccc(Cl)cc1Cl",
     k: int = 3,
-    search_width: int = 4,
-    exhaustiveness: int = 8,
-    num_cycles: int = 1,
+    effort: Effort = "low",
+    verbose: bool = False,
 ) -> None:
     payload = RoutesRequest(
         smiles=[s.strip() for s in smiles.split(",") if s.strip()],
         k=k,
-        search_width=search_width,
-        exhaustiveness=exhaustiveness,
-        num_cycles=num_cycles,
+        effort=effort,
+        verbose=verbose,
     )
     print(ReaSynService().sample_many.remote(payload.model_dump()))
 
