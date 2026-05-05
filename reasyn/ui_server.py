@@ -14,6 +14,7 @@ from fastapi.responses import HTMLResponse, JSONResponse, StreamingResponse
 DEFAULT_MODAL_ENDPOINT = "https://edisonscientific--reasyn-routes.modal.run"
 DEFAULT_MODAL_STREAM_ENDPOINT = "https://edisonscientific--reasyn-routes-stream.modal.run"
 DEFAULT_RENDERER = "http://mol2txt.app/"
+DEFAULT_RENDERER_FORMAT = "png"
 TOKEN_FILE = pathlib.Path("/tmp/reasyn_web_auth_token")
 
 app = FastAPI(title="ReaSyn Local UI")
@@ -38,6 +39,13 @@ def _modal_stream_endpoint() -> str:
 
 def _renderer_endpoint() -> str:
     return os.environ.get("REASYN_RENDERER_ENDPOINT", DEFAULT_RENDERER)
+
+
+def _renderer_format() -> str:
+    renderer_format = os.environ.get("REASYN_RENDERER_FORMAT", DEFAULT_RENDERER_FORMAT).lower()
+    if renderer_format not in {"png", "svg"}:
+        return DEFAULT_RENDERER_FORMAT
+    return renderer_format
 
 
 def _modal_payload(payload: dict[str, Any]) -> dict[str, Any]:
@@ -100,6 +108,7 @@ def config() -> dict[str, Any]:
         "modal_stream_endpoint": _modal_stream_endpoint(),
         "has_token": _auth_token() is not None,
         "renderer_endpoint": _renderer_endpoint(),
+        "renderer_format": _renderer_format(),
     }
 
 
@@ -353,12 +362,20 @@ HTML = r"""<!doctype html>
     .metric.warn { background: rgba(184,95,66,0.15); color: #813e2c; }
     .viz {
       width: 100%;
-      min-height: 180px;
+      min-height: 260px;
+      max-height: 560px;
       background: white;
       border: 1px solid var(--line);
       border-radius: 18px;
-      padding: 10px;
       object-fit: contain;
+    }
+    .viz-link {
+      display: inline-block;
+      margin-top: 6px;
+      color: var(--blue);
+      font-size: 12px;
+      font-weight: 800;
+      text-decoration: none;
     }
     .step-list { display: grid; gap: 12px; margin-top: 14px; }
     .step {
@@ -367,6 +384,7 @@ HTML = r"""<!doctype html>
       gap: 12px;
       align-items: start;
     }
+    .step-body { min-width: 0; }
     .step-index {
       font-weight: 900;
       color: var(--clay);
@@ -374,6 +392,34 @@ HTML = r"""<!doctype html>
       text-transform: uppercase;
       font-size: 12px;
       padding-top: 12px;
+    }
+    .step-summary {
+      display: grid;
+      gap: 8px;
+      margin: 0 0 10px;
+      padding: 12px;
+      border-radius: 16px;
+      background: rgba(33, 61, 48, 0.06);
+      color: var(--muted);
+      font-size: 13px;
+    }
+    .step-summary code, .template-list code {
+      overflow-wrap: anywhere;
+      white-space: normal;
+    }
+    .template-list {
+      display: grid;
+      gap: 8px;
+      margin-top: 10px;
+      font-size: 12px;
+      color: var(--muted);
+    }
+    .template-list b { color: var(--moss); }
+    .note {
+      color: var(--muted);
+      font-size: 12px;
+      line-height: 1.45;
+      margin: 8px 0 0;
     }
     details {
       margin-top: 14px;
@@ -478,6 +524,7 @@ CC(=O)Oc1ccccc1C(=O)O</textarea>
     const advancedToggle = document.getElementById("advanced-toggle");
     const advanced = document.getElementById("advanced");
     let renderer = "http://mol2txt.app/";
+    let rendererFormat = "png";
 
     const escapeHtml = (value) => String(value ?? "").replace(/[&<>"']/g, (ch) => ({
       "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#039;"
@@ -486,7 +533,7 @@ CC(=O)Oc1ccccc1C(=O)O</textarea>
     const rendererUrl = (params) => {
       const url = new URL(renderer);
       Object.entries(params).forEach(([key, value]) => url.searchParams.set(key, value));
-      url.searchParams.set("format", "svg");
+      url.searchParams.set("format", rendererFormat);
       return url.toString();
     };
     const molUrl = (smi) => rendererUrl({ smi });
@@ -500,11 +547,12 @@ CC(=O)Oc1ccccc1C(=O)O</textarea>
       const response = await fetch("/api/config");
       const config = await response.json();
       renderer = config.renderer_endpoint;
+      rendererFormat = config.renderer_format || "png";
       statusBox.innerHTML = `
         Modal endpoint: <strong>${escapeHtml(config.modal_endpoint)}</strong><br>
         Stream endpoint: <strong>${escapeHtml(config.modal_stream_endpoint)}</strong><br>
         Auth token: <strong>${config.has_token ? "available" : "missing"}</strong><br>
-        Renderer: <strong>${escapeHtml(config.renderer_endpoint)}</strong>
+        Renderer: <strong>${escapeHtml(config.renderer_endpoint)}</strong> (${escapeHtml(rendererFormat)})
       `;
     }
 
@@ -557,6 +605,31 @@ CC(=O)Oc1ccccc1C(=O)O</textarea>
         </details>`;
     }
 
+    function renderTemplateList(label, values) {
+      if (!values || !values.length) return `<div><b>${escapeHtml(label)}:</b> none in template</div>`;
+      return `<div><b>${escapeHtml(label)}:</b> ${values.map((value) => `<code>${escapeHtml(value)}</code>`).join(" | ")}</div>`;
+    }
+
+    function renderStepDetails(step) {
+      const reaction = step.reaction || {};
+      return `
+        <div class="step-summary">
+          <div><b>Actual reactants:</b> <code>${escapeHtml((step.reactants || []).join(" . "))}</code></div>
+          <div><b>Actual product:</b> <code>${escapeHtml(step.product)}</code></div>
+        </div>
+        <details>
+          <summary>Reaction template details</summary>
+          <p class="note">${escapeHtml(reaction.metadata_note || "This model exposes reaction SMARTS templates, not named conditions.")}</p>
+          <div class="template-list">
+            <div><b>Template ID:</b> R${escapeHtml(step.rxn_id)}</div>
+            <div><b>Full SMARTS:</b> <code>${escapeHtml(step.reaction_smarts || reaction.smarts)}</code></div>
+            ${renderTemplateList("Reactant template SMARTS", reaction.reactant_templates)}
+            ${renderTemplateList("Agent/reagent SMARTS", reaction.agent_templates)}
+            ${renderTemplateList("Product template SMARTS", reaction.product_templates)}
+          </div>
+        </details>`;
+    }
+
     function renderRoute(route) {
       if (Array.isArray(route)) {
         return `<article class="route"><pre>${escapeHtml(route.join("\n"))}</pre></article>`;
@@ -567,12 +640,16 @@ CC(=O)Oc1ccccc1C(=O)O</textarea>
       return `
         <article class="route">
           <div class="route-head">${routeMetrics(route)}</div>
-          ${multistep ? `<img class="viz" alt="multistep reaction" src="${rxnUrl(multistep)}" />` : ""}
+          ${multistep ? `<img class="viz" alt="multistep reaction" src="${rxnUrl(multistep)}" /><a class="viz-link" href="${rxnUrl(multistep)}" target="_blank" rel="noreferrer">Open full route image</a>` : ""}
           <div class="step-list">
             ${steps.map((step, index) => `
               <div class="step">
                 <div class="step-index">Step ${index + 1}<br>R${step.rxn_id}</div>
-                <img class="viz" alt="reaction step ${index + 1}" src="${rxnUrl(step.reaction_smiles)}" />
+                <div class="step-body">
+                  ${renderStepDetails(step)}
+                  <img class="viz" alt="reaction step ${index + 1}" src="${rxnUrl(step.reaction_smiles)}" />
+                  <a class="viz-link" href="${rxnUrl(step.reaction_smiles)}" target="_blank" rel="noreferrer">Open step image</a>
+                </div>
               </div>
             `).join("")}
           </div>

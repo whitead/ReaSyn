@@ -88,9 +88,13 @@ class Reaction:
 
     @cached_property
     def reactant_templates(self) -> tuple[Template, ...]:
-        # reactant_smarts = self.smarts.split(">")[0].split(".")
         reactant_smarts = [Chem.MolToSmarts(self._reaction.GetReactantTemplate(i)) for i in range(self.num_reactants)]
         return tuple(Template(s) for s in reactant_smarts)
+
+    @cached_property
+    def agent_templates(self) -> tuple[Template, ...]:
+        agent_smarts = [Chem.MolToSmarts(self._reaction.GetAgentTemplate(i)) for i in range(self.num_agents)]
+        return tuple(Template(s) for s in agent_smarts)
 
     def match_reactant_templates(self, mol: Molecule) -> tuple[int, ...]:
         matched: list[int] = []
@@ -101,7 +105,7 @@ class Reaction:
 
     @cached_property
     def product_templates(self) -> tuple[Template, ...]:
-        product_smarts = self.smarts.split(">")[2].split(".")
+        product_smarts = [Chem.MolToSmarts(self._reaction.GetProductTemplate(i)) for i in range(self.num_products)]
         return tuple(Template(s) for s in product_smarts)
 
     def is_reactant(self, mol: Molecule) -> bool:

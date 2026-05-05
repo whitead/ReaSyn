@@ -199,6 +199,22 @@ def _multistep_reaction_smiles(steps: list[dict[str, Any]]) -> str:
     return chain
 
 
+def _reaction_details(reaction: Any) -> dict[str, Any]:
+    return {
+        "smarts": reaction.smarts,
+        "num_reactants": reaction.num_reactants,
+        "num_agents": reaction.num_agents,
+        "num_products": reaction.num_products,
+        "reactant_templates": [template.smarts for template in reaction.reactant_templates],
+        "agent_templates": [template.smarts for template in reaction.agent_templates],
+        "product_templates": [template.smarts for template in reaction.product_templates],
+        "metadata_note": (
+            "The bundled ReaSyn template set contains SMARTS templates, not named "
+            "reagents, catalysts, solvents, or reaction conditions."
+        ),
+    }
+
+
 class _ReaSynRuntimeMixin:
     def _load_engine(self) -> None:
         from reasyn.inference import ReaSynInference
@@ -387,6 +403,7 @@ class _ReaSynRuntimeMixin:
                     "product": step.product,
                     "reaction_smiles": step.reaction_smiles,
                     "reaction_smarts": step.reaction_smarts,
+                    "reaction": _reaction_details(self.engine.runtime.rxn_matrix.reactions[step.rxn_id]),
                 }
                 for step in validation.steps
             ]

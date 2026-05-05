@@ -257,9 +257,13 @@ curl -N -X POST https://<workspace>--reasyn-routes-stream.modal.run \
 
 Progress events include cache status, phase boundaries, autoregressive step
 completion, active/finished/aborted state counts, best score so far, and final
-per-molecule route payloads. Streaming is intended for inspection and UI
-feedback; it does not use Modal dynamic batching because generator calls need to
-flush events as they happen.
+per-molecule route payloads. Verbose route steps include the actual forward
+reactants/products plus reaction template SMARTS, reactant template SMARTS,
+agent template SMARTS when present, and product template SMARTS. The bundled
+template set does not include named reagents, catalysts, solvents, or
+conditions. Streaming is intended for inspection and UI feedback; it does not
+use Modal dynamic batching because generator calls need to flush events as they
+happen.
 
 #### Bring Your Own FastAPI/Auth
 
@@ -361,9 +365,10 @@ http://127.0.0.1:8765
 The UI always sends `verbose=true` to Modal and uses the SSE endpoint by default
 so it can show how the algorithm is behaving: effort preset, optional overrides,
 cache hits, current sampler phase, active/finished state counts, best score,
-generated product, stack tokens, building blocks, RDKit validation status, and
-the concrete forward reaction SMILES for each step. It also builds a chained
-multistep reaction SMILES and sends it to `mol2txt.app` for visualization.
+generated product, stack tokens, building blocks, RDKit validation status,
+reaction template SMARTS, and the concrete forward reaction SMILES for each
+step. It also builds a chained multistep reaction SMILES and sends it to
+`mol2txt.app` for PNG visualization by default.
 
 Environment variables:
 
@@ -375,6 +380,8 @@ Environment variables:
   deployed example stream endpoint used during development.
 - `REASYN_RENDERER_ENDPOINT`: molecule/reaction renderer. Defaults to
   `http://mol2txt.app/`.
+- `REASYN_RENDERER_FORMAT`: `png` or `svg`. Defaults to `png` because the local
+  explorer is optimized for thicker, easier-to-read reaction drawings.
 
 ## Data Preparation
 
