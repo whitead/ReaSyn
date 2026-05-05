@@ -72,7 +72,7 @@ class SearchOverrides(BaseModel):
     num_cycles: int | None = Field(default=None, ge=1, le=12)
     num_editflow_samples: int | None = Field(default=None, ge=1, le=100)
     num_editflow_steps: int | None = Field(default=None, ge=1, le=200)
-    time_limit: int | None = Field(default=None, ge=0, le=1800)
+    time_limit: int | None = Field(default=None, ge=1, le=1800)
 
 
 class RoutesRequest(BaseModel):
@@ -81,6 +81,7 @@ class RoutesRequest(BaseModel):
     smiles: list[str] = Field(..., min_length=1)
     k: int = Field(default=10, ge=1, le=100)
     effort: Effort = "medium"
+    timeout_seconds: int | None = Field(default=None, ge=1, le=1800)
     verbose: bool = False
     overrides: SearchOverrides | None = None
 
@@ -161,10 +162,12 @@ def _sse(event: dict[str, Any]) -> str:
 def _effective_search(request: RoutesRequest) -> dict[str, int]:
     preset = EFFORT_PRESETS[request.effort].copy()
     if request.overrides is None:
-        return preset
-
-    for key, value in request.overrides.model_dump(exclude_none=True).items():
-        preset[key] = value
+        pass
+    else:
+        for key, value in request.overrides.model_dump(exclude_none=True).items():
+            preset[key] = value
+    if request.timeout_seconds is not None:
+        preset["time_limit"] = request.timeout_seconds
     return preset
 
 
@@ -174,6 +177,7 @@ def _route_cache_key(smiles: str, request: RoutesRequest) -> tuple[Any, ...]:
         smiles,
         request.k,
         request.effort,
+        request.timeout_seconds,
         tuple(sorted(effective_search.items())),
     )
 
@@ -184,6 +188,10 @@ def _synthesis_tokens(synthesis: str) -> list[str]:
 
 def _building_blocks(synthesis: str) -> list[str]:
     return [token for token in _synthesis_tokens(synthesis) if not token.startswith("R")]
+
+
+def _no_exact_routes_error(timeout_seconds: int) -> str:
+    return f"No exact RDKit-forward routes to the requested target were found before the {timeout_seconds}s timeout."
 
 
 def _multistep_reaction_smiles(steps: list[dict[str, Any]]) -> str:
@@ -299,6 +307,10 @@ class _ReaSynRuntimeMixin:
         except Exception as exc:
             return MoleculeRoutes(input=smiles, routes=[], error=str(exc))
 
+        if not routes:
+            timeout_seconds = _effective_search(request)["time_limit"]
+            return MoleculeRoutes(input=smiles, routes=[], error=_no_exact_routes_error(timeout_seconds))
+
         if not request.verbose:
             return MoleculeRoutes(input=smiles, routes=_compact_routes(routes))
 
@@ -336,11 +348,14 @@ class _ReaSynRuntimeMixin:
                     for route in routes:
                         route["search"]["cache_hit"] = cache_hit
                     route_payload = routes
+                error = None
+                if not routes:
+                    error = _no_exact_routes_error(_effective_search(request)["time_limit"])
                 emit(
                     {
                         "event": "molecule_completed",
                         "cache_hit": cache_hit,
-                        "result": MoleculeRoutes(input=smiles, routes=route_payload).model_dump(),
+                        "result": MoleculeRoutes(input=smiles, routes=route_payload, error=error).model_dump(),
                     }
                 )
             except Exception as exc:
@@ -406,16 +421,20 @@ class _ReaSynRuntimeMixin:
             num_cycles=preset["num_cycles"],
             num_editflow_samples=preset["num_editflow_samples"],
             num_editflow_steps=preset["num_editflow_steps"],
+            exact_target_only=True,
+            min_exact_results=request.k,
             progress_callback=progress_callback,
         )
 
         routes = []
-        for rank, row in enumerate(df.head(request.k).to_dict(orient="records"), start=1):
+        for row in df.head(request.k).to_dict(orient="records"):
             validation = validate_route_forward(
                 synthesis=str(row["synthesis"]),
-                expected_product=str(row["smiles"]),
+                expected_product=smiles,
                 reactions=self.engine.runtime.rxn_matrix.reactions,
             )
+            if not validation.valid:
+                continue
             reaction_smiles = [step.reaction_smiles for step in validation.steps]
             forward_steps = [
                 {
@@ -434,19 +453,21 @@ class _ReaSynRuntimeMixin:
             synthesis = str(row["synthesis"])
             routes.append(
                 {
-                    "rank": rank,
+                    "rank": len(routes) + 1,
                     "reaction_smiles": reaction_smiles,
                     "multistep_reaction_smiles": _multistep_reaction_smiles(forward_steps),
                     "synthesis_tokens": _synthesis_tokens(synthesis),
                     "building_blocks": _building_blocks(synthesis),
                     "num_forward_steps": len(forward_steps),
                     "effort": request.effort,
+                    "timeout_seconds": preset["time_limit"],
                     "search": {
                         **preset,
                         "overrides_applied": request.overrides is not None,
                         "modal_request_batch_size": getattr(self, "_last_batch_size", 1),
                         "cache_hit": False,
                         "cache_ttl_seconds": CACHE_TTL_SECONDS,
+                        "exact_target_only": True,
                     },
                     **{key: _jsonable(value) for key, value in row.items()},
                     "forward_valid": validation.valid,
@@ -575,12 +596,14 @@ def main(
     smiles: str = "O=C(Nc1ccc(F)cc1)N(Cc1noc(C2CC2)n1)c1ccc(Cl)cc1Cl",
     k: int = 3,
     effort: Effort = "low",
+    timeout_seconds: int = 300,
     verbose: bool = False,
 ) -> None:
     payload = RoutesRequest(
         smiles=[s.strip() for s in smiles.split(",") if s.strip()],
         k=k,
         effort=effort,
+        timeout_seconds=timeout_seconds,
         verbose=verbose,
     )
     print(ReaSynService().sample_many.remote(payload.model_dump()))

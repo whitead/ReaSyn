@@ -14,7 +14,6 @@ from fastapi.responses import HTMLResponse, JSONResponse, StreamingResponse
 DEFAULT_MODAL_ENDPOINT = "https://edisonscientific--reasyn-routes.modal.run"
 DEFAULT_MODAL_STREAM_ENDPOINT = "https://edisonscientific--reasyn-routes-stream.modal.run"
 DEFAULT_RENDERER = "http://mol2txt.app/"
-DEFAULT_RENDERER_FORMAT = "png"
 TOKEN_FILE = pathlib.Path("/tmp/reasyn_web_auth_token")
 
 app = FastAPI(title="ReaSyn Local UI")
@@ -41,13 +40,6 @@ def _renderer_endpoint() -> str:
     return os.environ.get("REASYN_RENDERER_ENDPOINT", DEFAULT_RENDERER)
 
 
-def _renderer_format() -> str:
-    renderer_format = os.environ.get("REASYN_RENDERER_FORMAT", DEFAULT_RENDERER_FORMAT).lower()
-    if renderer_format not in {"png", "svg"}:
-        return DEFAULT_RENDERER_FORMAT
-    return renderer_format
-
-
 def _modal_payload(payload: dict[str, Any]) -> dict[str, Any]:
     smiles = payload.get("smiles", [])
     if isinstance(smiles, str):
@@ -59,6 +51,7 @@ def _modal_payload(payload: dict[str, Any]) -> dict[str, Any]:
         "smiles": smiles,
         "k": int(payload.get("k", 3)),
         "effort": payload.get("effort", "low"),
+        "timeout_seconds": int(payload.get("timeout_seconds", 300)),
         "verbose": True,
     }
     overrides = payload.get("overrides")
@@ -90,6 +83,12 @@ def _authorized_request(url: str, payload: dict[str, Any]) -> urllib.request.Req
     )
 
 
+def _request_timeout(payload: dict[str, Any]) -> int:
+    if "timeout" in payload:
+        return int(payload["timeout"])
+    return int(payload.get("timeout_seconds", 300)) + 60
+
+
 def _sse(event: dict[str, Any]) -> str:
     event_name = str(event.get("event", "message"))
     data = json.dumps(event, separators=(",", ":"))
@@ -108,7 +107,7 @@ def config() -> dict[str, Any]:
         "modal_stream_endpoint": _modal_stream_endpoint(),
         "has_token": _auth_token() is not None,
         "renderer_endpoint": _renderer_endpoint(),
-        "renderer_format": _renderer_format(),
+        "renderer_format": "png",
     }
 
 
@@ -116,7 +115,7 @@ def config() -> dict[str, Any]:
 def proxy_routes(payload: dict[str, Any]) -> JSONResponse:
     request = _authorized_request(_modal_endpoint(), _modal_payload(payload))
     try:
-        with urllib.request.urlopen(request, timeout=payload.get("timeout", 1800)) as response:
+        with urllib.request.urlopen(request, timeout=_request_timeout(payload)) as response:
             data = json.loads(response.read().decode("utf-8"))
             return JSONResponse(data)
     except urllib.error.HTTPError as exc:
@@ -136,7 +135,7 @@ def proxy_routes_stream(payload: dict[str, Any]) -> StreamingResponse:
 
     def events():
         try:
-            with urllib.request.urlopen(request, timeout=payload.get("timeout", 1800)) as response:
+            with urllib.request.urlopen(request, timeout=_request_timeout(payload)) as response:
                 while True:
                     line = response.readline()
                     if not line:
@@ -480,23 +479,30 @@ HTML = r"""<!doctype html>
   <main class="shell">
     <form id="route-form" class="panel">
       <label for="smiles">Input molecules</label>
-      <textarea id="smiles" spellcheck="false">c1ccccc1
-CC(=O)Oc1ccccc1C(=O)O</textarea>
+      <textarea id="smiles" spellcheck="false">O=C(O)c1ccccc1</textarea>
 
       <div class="grid2">
         <div>
           <label for="k">Routes per molecule</label>
-          <input id="k" type="number" min="1" max="20" value="3" />
+          <input id="k" type="number" min="1" max="20" value="1" />
         </div>
         <div>
-          <label for="effort">Effort</label>
-          <select id="effort">
-            <option value="low">low</option>
-            <option value="medium">medium</option>
-            <option value="high">high</option>
-          </select>
+          <label for="timeout-seconds">Timeout seconds</label>
+          <input id="timeout-seconds" type="number" min="10" max="1800" value="300" />
         </div>
       </div>
+
+      <label for="effort">Search profile</label>
+      <select id="effort">
+        <option value="low">low</option>
+        <option value="medium" selected>medium</option>
+        <option value="high">high</option>
+      </select>
+
+      <p class="note">
+        Only exact RDKit-forward routes to the requested target are returned. If none are found,
+        the worker keeps searching until this timeout.
+      </p>
 
       <label class="checkbox">
         <input id="advanced-toggle" type="checkbox" />
@@ -509,7 +515,6 @@ CC(=O)Oc1ccccc1C(=O)O</textarea>
           <div><label>Cycles</label><input data-override="num_cycles" type="number" min="1" max="12" placeholder="preset" /></div>
           <div><label>Edit samples</label><input data-override="num_editflow_samples" type="number" min="1" max="100" placeholder="preset" /></div>
           <div><label>Edit steps</label><input data-override="num_editflow_steps" type="number" min="1" max="200" placeholder="preset" /></div>
-          <div><label>Time limit</label><input data-override="time_limit" type="number" min="0" max="1800" placeholder="preset" /></div>
         </div>
       </div>
 
@@ -532,7 +537,6 @@ CC(=O)Oc1ccccc1C(=O)O</textarea>
     const advancedToggle = document.getElementById("advanced-toggle");
     const advanced = document.getElementById("advanced");
     let renderer = "http://mol2txt.app/";
-    let rendererFormat = "png";
 
     const escapeHtml = (value) => String(value ?? "").replace(/[&<>"']/g, (ch) => ({
       "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#039;"
@@ -541,7 +545,7 @@ CC(=O)Oc1ccccc1C(=O)O</textarea>
     const rendererUrl = (params) => {
       const url = new URL(renderer);
       Object.entries(params).forEach(([key, value]) => url.searchParams.set(key, value));
-      url.searchParams.set("format", rendererFormat);
+      url.searchParams.set("format", "png");
       return url.toString();
     };
     const molUrl = (smi) => rendererUrl({ smi });
@@ -555,12 +559,11 @@ CC(=O)Oc1ccccc1C(=O)O</textarea>
       const response = await fetch("/api/config");
       const config = await response.json();
       renderer = config.renderer_endpoint;
-      rendererFormat = config.renderer_format || "png";
       statusBox.innerHTML = `
         Modal endpoint: <strong>${escapeHtml(config.modal_endpoint)}</strong><br>
         Stream endpoint: <strong>${escapeHtml(config.modal_stream_endpoint)}</strong><br>
         Auth token: <strong>${config.has_token ? "available" : "missing"}</strong><br>
-        Renderer: <strong>${escapeHtml(config.renderer_endpoint)}</strong> (${escapeHtml(rendererFormat)})
+        Renderer: <strong>${escapeHtml(config.renderer_endpoint)}</strong> (png)
       `;
     }
 
@@ -573,6 +576,7 @@ CC(=O)Oc1ccccc1C(=O)O</textarea>
         smiles,
         k: Number(document.getElementById("k").value || 3),
         effort: document.getElementById("effort").value,
+        timeout_seconds: Number(document.getElementById("timeout-seconds").value || 300),
       };
       if (advancedToggle.checked) {
         const overrides = {};
@@ -591,7 +595,9 @@ CC(=O)Oc1ccccc1C(=O)O</textarea>
         `<span class="metric ${route.forward_valid ? "good" : "warn"}">${route.forward_valid ? "RDKit valid" : "not validated"}</span>`,
         `<span class="metric">score ${Number(route.score ?? 0).toFixed(3)}</span>`,
         `<span class="metric">${route.num_forward_steps ?? 0} rxn steps</span>`,
-        `<span class="metric">${route.effort} effort</span>`,
+        `<span class="metric">${route.effort} profile</span>`,
+        `<span class="metric">${route.timeout_seconds ?? search.time_limit}s timeout</span>`,
+        `<span class="metric good">exact target</span>`,
         `<span class="metric ${search.cache_hit ? "good" : ""}">${search.cache_hit ? "cache hit" : "fresh search"}</span>`,
       ].join("");
     }
@@ -720,6 +726,10 @@ CC(=O)Oc1ccccc1C(=O)O</textarea>
       if (event.event === "active_states_resampled") return `${prefix}resampled active states from finished routes.`;
       if (event.event === "ar_step_completed") return `${prefix}${event.phase} step ${event.step} completed.`;
       if (event.event === "phase_completed") return `${prefix}${event.phase} phase completed.`;
+      if (event.event === "exact_search_round_started") return `${prefix}exact-route search round ${event.round} started.`;
+      if (event.event === "exact_routes_status") return `${prefix}${event.exact_routes}/${event.requested_exact_routes} exact route(s) found so far.`;
+      if (event.event === "exact_search_restarted") return `${prefix}sampler stalled without exact routes; restarting search.`;
+      if (event.event === "exact_search_timeout") return `${prefix}timeout reached with ${event.exact_routes}/${event.requested_exact_routes} exact route(s).`;
       if (event.event === "exact_match_found") return `${prefix}exact fingerprint match found; stopping early.`;
       if (event.event === "time_limit_exceeded") return `${prefix}time limit reached.`;
       if (event.event === "search_completed") return `${prefix}sampler completed.`;

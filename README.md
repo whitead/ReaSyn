@@ -156,7 +156,8 @@ The public request schema is intentionally small:
 {
   "smiles": ["CCO", "c1ccccc1"],
   "k": 2,
-  "effort": "low",
+  "effort": "medium",
+  "timeout_seconds": 300,
   "verbose": false,
   "overrides": {
     "search_width": 2,
@@ -165,19 +166,24 @@ The public request schema is intentionally small:
 }
 ```
 
-`effort` must be `low`, `medium`, or `high`. `overrides` is optional and is
-intended for demos or debugging; if omitted, the effort preset controls all
-search settings. `verbose=false` returns only RDKit-forward reaction SMILES for
-each route. `verbose=true` also returns the generated molecule, scores,
-effective search preset, stack tokens, building blocks, a chained multistep
+`effort` must be `low`, `medium`, or `high`; it controls the search shape
+(`search_width`, `exhaustiveness`, cycles, and editflow settings), not the wall
+clock budget. `timeout_seconds` controls how long the worker keeps searching for
+exact RDKit-forward routes to the requested target. `overrides` is optional and
+is intended for demos or debugging. Responses only include routes whose
+forward-executed product exactly matches the requested target; if none are
+found before timeout, the molecule returns an empty route list with an error
+message. `verbose=false` returns only RDKit-forward reaction SMILES for each
+exact route. `verbose=true` also returns the generated molecule, scores,
+effective search settings, stack tokens, building blocks, a chained multistep
 reaction SMILES string, `forward_valid`, `forward_error`,
 `forward_candidate_count`, and `forward_steps`.
 
 The GPU worker keeps a short per-container cache for `(smiles, k, effort,
-effective search settings)`. `verbose` is intentionally not part of the cache
-key, so a client can first request compact output and then re-request the same
-inputs with `verbose=true` to get details without rerunning inference when the
-request lands on the same warm worker.
+timeout_seconds, effective search settings)`. `verbose` is intentionally not
+part of the cache key, so a client can first request compact output and then
+re-request the same inputs with `verbose=true` to get details without rerunning
+inference when the request lands on the same warm worker.
 
 #### Deploy The Included Endpoint
 
@@ -233,9 +239,10 @@ curl -X POST https://<workspace>--reasyn-routes.modal.run \
   -H "Content-Type: application/json" \
   -H "Authorization: Bearer $REASYN_AUTH_TOKEN" \
   -d '{
-    "smiles": ["CCO", "c1ccccc1"],
+    "smiles": ["O=C(O)c1ccccc1"],
     "k": 2,
-    "effort": "low",
+    "effort": "medium",
+    "timeout_seconds": 300,
     "verbose": false
   }'
 ```
@@ -248,9 +255,10 @@ curl -N -X POST https://<workspace>--reasyn-routes-stream.modal.run \
   -H "Content-Type: application/json" \
   -H "Authorization: Bearer $REASYN_AUTH_TOKEN" \
   -d '{
-    "smiles": ["CCO"],
+    "smiles": ["O=C(O)c1ccccc1"],
     "k": 2,
-    "effort": "low",
+    "effort": "medium",
+    "timeout_seconds": 300,
     "verbose": true
   }'
 ```
@@ -298,9 +306,10 @@ method from your service process:
 from modal_app import ReaSynService
 
 payload = {
-    "smiles": ["CCO", "c1ccccc1"],
+    "smiles": ["O=C(O)c1ccccc1"],
     "k": 2,
     "effort": "medium",
+    "timeout_seconds": 300,
     "verbose": True,
 }
 result = ReaSynService().sample_many.remote(payload)
@@ -364,12 +373,13 @@ http://127.0.0.1:8765
 ```
 
 The UI always sends `verbose=true` to Modal and uses the SSE endpoint by default
-so it can show how the algorithm is behaving: effort preset, optional overrides,
-cache hits, current sampler phase, active/finished state counts, best score,
-generated product, stack tokens, building blocks, RDKit validation status,
-reaction class annotations, reaction template SMARTS, and the concrete forward
-reaction SMILES for each step. It also builds a chained multistep reaction
-SMILES and sends it to `mol2txt.app` for PNG visualization by default.
+so it can show how the algorithm is behaving: timeout, search profile, optional
+overrides, cache hits, current sampler phase, active/finished state counts, exact
+route count, best score, generated product, stack tokens, building blocks, RDKit
+validation status, reaction class annotations, reaction template SMARTS, and the
+concrete forward reaction SMILES for each step. It only displays exact
+RDKit-forward routes to the requested target and always sends reactions and
+molecules to `mol2txt.app` as PNG images.
 
 Environment variables:
 
@@ -381,8 +391,6 @@ Environment variables:
   deployed example stream endpoint used during development.
 - `REASYN_RENDERER_ENDPOINT`: molecule/reaction renderer. Defaults to
   `http://mol2txt.app/`.
-- `REASYN_RENDERER_FORMAT`: `png` or `svg`. Defaults to `png` because the local
-  explorer is optimized for thicker, easier-to-read reaction drawings.
 
 ## Data Preparation
 
