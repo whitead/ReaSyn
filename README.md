@@ -157,7 +157,7 @@ The public request schema is intentionally small:
   "smiles": ["CCO", "c1ccccc1"],
   "k": 2,
   "effort": "medium",
-  "timeout_seconds": 300,
+  "timeout_seconds": 900,
   "verbose": false,
   "overrides": {
     "search_width": 2,
@@ -178,6 +178,17 @@ exact route. `verbose=true` also returns the generated molecule, scores,
 effective search settings, stack tokens, building blocks, a chained multistep
 reaction SMILES string, `forward_valid`, `forward_error`,
 `forward_candidate_count`, and `forward_steps`.
+
+Default effort presets are:
+
+- `low`: narrow search, 120s default timeout.
+- `medium`: broader search, 900s default timeout.
+- `high`: aggressive search, 1800s default timeout, with larger width,
+  exhaustiveness, cycles, and editflow sampling.
+
+The local UI sets timeout defaults to 300s, 900s, and 1800s for low, medium,
+and high profiles respectively. API callers can set `timeout_seconds` up to
+3600.
 
 The GPU worker keeps a short per-container cache for `(smiles, k, effort,
 timeout_seconds, effective search settings)`. `verbose` is intentionally not
@@ -242,7 +253,7 @@ curl -X POST https://<workspace>--reasyn-routes.modal.run \
     "smiles": ["O=C(O)c1ccccc1"],
     "k": 2,
     "effort": "medium",
-    "timeout_seconds": 300,
+    "timeout_seconds": 900,
     "verbose": false
   }'
 ```
@@ -258,7 +269,7 @@ curl -N -X POST https://<workspace>--reasyn-routes-stream.modal.run \
     "smiles": ["O=C(O)c1ccccc1"],
     "k": 2,
     "effort": "medium",
-    "timeout_seconds": 300,
+    "timeout_seconds": 900,
     "verbose": true
   }'
 ```
@@ -309,7 +320,7 @@ payload = {
     "smiles": ["O=C(O)c1ccccc1"],
     "k": 2,
     "effort": "medium",
-    "timeout_seconds": 300,
+    "timeout_seconds": 900,
     "verbose": True,
 }
 result = ReaSynService().sample_many.remote(payload)

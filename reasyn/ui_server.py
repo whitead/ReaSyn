@@ -51,7 +51,7 @@ def _modal_payload(payload: dict[str, Any]) -> dict[str, Any]:
         "smiles": smiles,
         "k": int(payload.get("k", 3)),
         "effort": payload.get("effort", "low"),
-        "timeout_seconds": int(payload.get("timeout_seconds", 300)),
+        "timeout_seconds": int(payload.get("timeout_seconds", 900)),
         "verbose": True,
     }
     overrides = payload.get("overrides")
@@ -86,7 +86,7 @@ def _authorized_request(url: str, payload: dict[str, Any]) -> urllib.request.Req
 def _request_timeout(payload: dict[str, Any]) -> int:
     if "timeout" in payload:
         return int(payload["timeout"])
-    return int(payload.get("timeout_seconds", 300)) + 60
+    return int(payload.get("timeout_seconds", 900)) + 60
 
 
 def _sse(event: dict[str, Any]) -> str:
@@ -488,7 +488,7 @@ HTML = r"""<!doctype html>
         </div>
         <div>
           <label for="timeout-seconds">Timeout seconds</label>
-          <input id="timeout-seconds" type="number" min="10" max="1800" value="300" />
+          <input id="timeout-seconds" type="number" min="10" max="3600" value="900" />
         </div>
       </div>
 
@@ -511,10 +511,10 @@ HTML = r"""<!doctype html>
       <div id="advanced" class="advanced">
         <div class="grid2">
           <div><label>Search width</label><input data-override="search_width" type="number" min="1" max="64" placeholder="preset" /></div>
-          <div><label>Exhaustiveness</label><input data-override="exhaustiveness" type="number" min="1" max="256" placeholder="preset" /></div>
-          <div><label>Cycles</label><input data-override="num_cycles" type="number" min="1" max="12" placeholder="preset" /></div>
+          <div><label>Exhaustiveness</label><input data-override="exhaustiveness" type="number" min="1" max="512" placeholder="preset" /></div>
+          <div><label>Cycles</label><input data-override="num_cycles" type="number" min="1" max="24" placeholder="preset" /></div>
           <div><label>Edit samples</label><input data-override="num_editflow_samples" type="number" min="1" max="100" placeholder="preset" /></div>
-          <div><label>Edit steps</label><input data-override="num_editflow_steps" type="number" min="1" max="200" placeholder="preset" /></div>
+          <div><label>Edit steps</label><input data-override="num_editflow_steps" type="number" min="1" max="300" placeholder="preset" /></div>
         </div>
       </div>
 
@@ -536,7 +536,12 @@ HTML = r"""<!doctype html>
     const submit = document.getElementById("submit");
     const advancedToggle = document.getElementById("advanced-toggle");
     const advanced = document.getElementById("advanced");
+    const effortSelect = document.getElementById("effort");
+    const timeoutInput = document.getElementById("timeout-seconds");
     let renderer = "http://mol2txt.app/";
+    let timeoutWasEdited = false;
+
+    const profileTimeouts = { low: 300, medium: 900, high: 1800 };
 
     const escapeHtml = (value) => String(value ?? "").replace(/[&<>"']/g, (ch) => ({
       "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#039;"
@@ -553,6 +558,12 @@ HTML = r"""<!doctype html>
 
     advancedToggle.addEventListener("change", () => {
       advanced.classList.toggle("on", advancedToggle.checked);
+    });
+    timeoutInput.addEventListener("input", () => {
+      timeoutWasEdited = true;
+    });
+    effortSelect.addEventListener("change", () => {
+      if (!timeoutWasEdited) timeoutInput.value = profileTimeouts[effortSelect.value] || 900;
     });
 
     async function loadConfig() {
@@ -575,8 +586,8 @@ HTML = r"""<!doctype html>
       const payload = {
         smiles,
         k: Number(document.getElementById("k").value || 3),
-        effort: document.getElementById("effort").value,
-        timeout_seconds: Number(document.getElementById("timeout-seconds").value || 300),
+        effort: effortSelect.value,
+        timeout_seconds: Number(timeoutInput.value || profileTimeouts[effortSelect.value] || 900),
       };
       if (advancedToggle.checked) {
         const overrides = {};
@@ -823,7 +834,7 @@ HTML = r"""<!doctype html>
       const started = performance.now();
       progressLog.innerHTML = "";
       statusBox.textContent = "Running verbose Modal stream...";
-      results.innerHTML = `<div class="panel empty">ReaSyn is searching. Low effort is usually quick; high effort can take several minutes.</div>`;
+      results.innerHTML = `<div class="panel empty">ReaSyn is searching for exact validated routes until the timeout is reached.</div>`;
 
       try {
         await runStreamingRequest(payloadFromForm());

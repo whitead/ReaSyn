@@ -47,19 +47,19 @@ EFFORT_PRESETS: dict[Effort, dict[str, int]] = {
     },
     "medium": {
         "search_width": 4,
-        "exhaustiveness": 8,
-        "num_cycles": 2,
-        "num_editflow_samples": 10,
-        "num_editflow_steps": 50,
-        "time_limit": 300,
+        "exhaustiveness": 16,
+        "num_cycles": 3,
+        "num_editflow_samples": 15,
+        "num_editflow_steps": 75,
+        "time_limit": 900,
     },
     "high": {
-        "search_width": 8,
-        "exhaustiveness": 32,
-        "num_cycles": 4,
-        "num_editflow_samples": 25,
-        "num_editflow_steps": 100,
-        "time_limit": 600,
+        "search_width": 16,
+        "exhaustiveness": 128,
+        "num_cycles": 8,
+        "num_editflow_samples": 50,
+        "num_editflow_steps": 150,
+        "time_limit": 1800,
     },
 }
 
@@ -68,11 +68,11 @@ class SearchOverrides(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
     search_width: int | None = Field(default=None, ge=1, le=64)
-    exhaustiveness: int | None = Field(default=None, ge=1, le=256)
-    num_cycles: int | None = Field(default=None, ge=1, le=12)
+    exhaustiveness: int | None = Field(default=None, ge=1, le=512)
+    num_cycles: int | None = Field(default=None, ge=1, le=24)
     num_editflow_samples: int | None = Field(default=None, ge=1, le=100)
-    num_editflow_steps: int | None = Field(default=None, ge=1, le=200)
-    time_limit: int | None = Field(default=None, ge=1, le=1800)
+    num_editflow_steps: int | None = Field(default=None, ge=1, le=300)
+    time_limit: int | None = Field(default=None, ge=1, le=3600)
 
 
 class RoutesRequest(BaseModel):
@@ -81,7 +81,7 @@ class RoutesRequest(BaseModel):
     smiles: list[str] = Field(..., min_length=1)
     k: int = Field(default=10, ge=1, le=100)
     effort: Effort = "medium"
-    timeout_seconds: int | None = Field(default=None, ge=1, le=1800)
+    timeout_seconds: int | None = Field(default=None, ge=1, le=3600)
     verbose: bool = False
     overrides: SearchOverrides | None = None
 

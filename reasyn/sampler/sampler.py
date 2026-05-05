@@ -287,8 +287,7 @@ class Sampler:
         assert len(tokens.shape) == 1, 'no batch allowed'
         
         if len(tokens) > self.model.max_len:
-            sampled_type = 'ABORTED'
-            sampled_item = None
+            return PredictResult('ABORTED', None)
         else:
             tokens = tokens[None, :]
             # for TD first token
