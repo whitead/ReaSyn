@@ -4,6 +4,8 @@
 from __future__ import annotations
 
 import time
+from collections.abc import Callable
+from typing import Any
 
 import pandas as pd
 
@@ -56,6 +58,7 @@ class ReaSynInference:
         num_editflow_steps: int = 100,
         mols_to_filter: list[Molecule] | None = None,
         filter_sim: float = 0.8,
+        progress_callback: Callable[[dict[str, Any]], None] | None = None,
     ) -> pd.DataFrame:
         mol = Molecule(smiles)
         sampler = Sampler(
@@ -78,6 +81,7 @@ class ReaSynInference:
             max_evolve_steps=max_evolve_steps,
             num_editflow_samples=num_editflow_samples,
             num_editflow_steps=num_editflow_steps,
+            progress_callback=progress_callback,
         )
         df = sampler.get_dataframe()[:max_results]
         df["time"] = time.time() - t_start

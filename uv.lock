@@ -2049,6 +2049,9 @@ train = [
     { name = "pytorch-lightning" },
     { name = "wandb" },
 ]
+ui = [
+    { name = "fastapi", extra = ["standard"] },
+]
 
 [package.dev-dependencies]
 dev = [
@@ -2072,6 +2075,7 @@ requires-dist = [
     { name = "editdistance", specifier = "==0.8.1" },
     { name = "einops", specifier = ">=0.8.0,<0.9" },
     { name = "fastapi", extras = ["standard"], marker = "extra == 'modal'", specifier = ">=0.115,<1" },
+    { name = "fastapi", extras = ["standard"], marker = "extra == 'ui'", specifier = ">=0.115,<1" },
     { name = "joblib", specifier = ">=1.4,<2" },
     { name = "modal", marker = "extra == 'modal'", specifier = ">=1.1,<2" },
     { name = "numpy", specifier = "==1.26.4" },
@@ -2088,7 +2092,7 @@ requires-dist = [
     { name = "tqdm", specifier = "==4.67.1" },
     { name = "wandb", marker = "extra == 'train'", specifier = "==0.19.11" },
 ]
-provides-extras = ["eval", "modal", "train"]
+provides-extras = ["eval", "modal", "train", "ui"]
 
 [package.metadata.requires-dev]
 dev = [

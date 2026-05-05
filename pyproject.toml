@@ -36,12 +36,16 @@ train = [
     "pytorch-lightning==2.5.3",
     "wandb==0.19.11",
 ]
+ui = [
+    "fastapi[standard]>=0.115,<1",
+]
 
 [project.scripts]
 reasyn-sample = "reasyn.cli.sample:main"
 reasyn-sample-one = "reasyn.cli.sample_one:main"
 reasyn-preprocess = "reasyn.cli.preprocess:main"
 reasyn-prepare-mcule-building-blocks = "reasyn.cli.prepare_mcule_building_blocks:main"
+reasyn-ui = "reasyn.cli.ui:main"
 
 [dependency-groups]
 dev = [

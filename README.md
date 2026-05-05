@@ -54,6 +54,7 @@ uv run reasyn-sample --help
 uv run reasyn-sample-one --help
 uv run reasyn-preprocess --help
 uv run reasyn-prepare-mcule-building-blocks --help
+uv run --extra ui reasyn-ui --help
 ```
 
 The original Conda environment is retained for reference:
@@ -136,13 +137,18 @@ docker run --rm --gpus all \
 
 ### Modal Integration
 
-`modal_app.py` contains a deployable Modal app with two separable parts:
+`modal_app.py` contains a deployable Modal app with separable parts:
 
 - `ReaSynService`: the GPU worker that loads checkpoints, MCule assets, runs
   inference, validates routes by forward-executing RDKit reactions, and uses
   Modal dynamic batching.
+- `ReaSynStreamService`: a generator worker with the same runtime that emits
+  sampler progress events while inference is running.
 - `routes`: a small FastAPI HTTP endpoint with bearer-token auth. This is a
   convenience wrapper around `ReaSynService`, not a requirement.
+- `routes_stream`: a Server-Sent Events endpoint for UI/demo clients that want
+  intermediate sampler progress. The regular `routes` endpoint remains the
+  best choice for high-throughput batched inference.
 
 The public request schema is intentionally small:
 
@@ -151,20 +157,27 @@ The public request schema is intentionally small:
   "smiles": ["CCO", "c1ccccc1"],
   "k": 2,
   "effort": "low",
-  "verbose": false
+  "verbose": false,
+  "overrides": {
+    "search_width": 2,
+    "exhaustiveness": 4
+  }
 }
 ```
 
-`effort` must be `low`, `medium`, or `high`. `verbose=false` returns only
-RDKit-forward reaction SMILES for each route. `verbose=true` also returns the
-generated molecule, scores, effective search preset, `forward_valid`,
-`forward_error`, `forward_candidate_count`, and `forward_steps`.
+`effort` must be `low`, `medium`, or `high`. `overrides` is optional and is
+intended for demos or debugging; if omitted, the effort preset controls all
+search settings. `verbose=false` returns only RDKit-forward reaction SMILES for
+each route. `verbose=true` also returns the generated molecule, scores,
+effective search preset, stack tokens, building blocks, a chained multistep
+reaction SMILES string, `forward_valid`, `forward_error`,
+`forward_candidate_count`, and `forward_steps`.
 
-The GPU worker keeps a short per-container cache for `(smiles, k, effort)`.
-`verbose` is intentionally not part of the cache key, so a client can first
-request compact output and then re-request the same inputs with `verbose=true`
-to get details without rerunning inference when the request lands on the same
-warm worker.
+The GPU worker keeps a short per-container cache for `(smiles, k, effort,
+effective search settings)`. `verbose` is intentionally not part of the cache
+key, so a client can first request compact output and then re-request the same
+inputs with `verbose=true` to get details without rerunning inference when the
+request lands on the same warm worker.
 
 #### Deploy The Included Endpoint
 
@@ -227,6 +240,27 @@ curl -X POST https://<workspace>--reasyn-routes.modal.run \
   }'
 ```
 
+The streaming endpoint uses the same auth and request schema, but returns
+`text/event-stream`:
+
+```bash
+curl -N -X POST https://<workspace>--reasyn-routes-stream.modal.run \
+  -H "Content-Type: application/json" \
+  -H "Authorization: Bearer $REASYN_AUTH_TOKEN" \
+  -d '{
+    "smiles": ["CCO"],
+    "k": 2,
+    "effort": "low",
+    "verbose": true
+  }'
+```
+
+Progress events include cache status, phase boundaries, autoregressive step
+completion, active/finished/aborted state counts, best score so far, and final
+per-molecule route payloads. Streaming is intended for inspection and UI
+feedback; it does not use Modal dynamic batching because generator calls need to
+flush events as they happen.
+
 #### Bring Your Own FastAPI/Auth
 
 If you already have server logic, keep `ReaSynService` and replace or ignore the
@@ -267,6 +301,28 @@ payload = {
 result = ReaSynService().sample_many.remote(payload)
 ```
 
+For a custom progress endpoint, wrap the worker generator in your own SSE or
+WebSocket logic:
+
+```python
+import json
+
+from fastapi.responses import StreamingResponse
+from modal_app import ReaSynStreamService
+
+
+def sse(event: dict) -> str:
+    return f"event: {event.get('event', 'message')}\ndata: {json.dumps(event)}\n\n"
+
+
+def your_stream(payload: dict) -> StreamingResponse:
+    def events():
+        for event in ReaSynStreamService().sample_stream.remote_gen(payload):
+            yield sse(event)
+
+    return StreamingResponse(events(), media_type="text/event-stream")
+```
+
 Keep these constraints in mind when bringing your own server:
 
 - The worker expects assets in Modal volume `reasyn-assets` under `/vol/reasyn`.
@@ -274,8 +330,51 @@ Keep these constraints in mind when bringing your own server:
   batched by Modal; each dictionary uses the same schema as the HTTP endpoint.
 - Leave batching on the worker side. Your server can send one request per user
   call; Modal coalesces concurrent calls up to `BATCH_MAX_REQUESTS`.
+- For progress UIs, expose your own SSE/WebSocket route and forward events from
+  `ReaSynStreamService().sample_stream.remote_gen(...)`. Use `sample_many` for
+  throughput-oriented JSON APIs and `sample_stream` for observability.
 - If you change auth or request models, keep `RoutesRequest` compatible or add
   an adapter before calling `sample_many.remote(...)`.
+
+### Local Route Explorer UI
+
+The local UI is a small FastAPI app that proxies requests to the Modal endpoint
+and renders molecules/reactions through `http://mol2txt.app`. The browser calls
+only the local proxy, so the Modal bearer token stays server-side and CORS is not
+an issue.
+
+Run it:
+
+```bash
+export REASYN_AUTH_TOKEN="<your Modal bearer token>"
+export REASYN_MODAL_ENDPOINT="https://<workspace>--reasyn-routes.modal.run"
+export REASYN_MODAL_STREAM_ENDPOINT="https://<workspace>--reasyn-routes-stream.modal.run"
+uv run --extra ui reasyn-ui
+```
+
+Then open:
+
+```text
+http://127.0.0.1:8765
+```
+
+The UI always sends `verbose=true` to Modal and uses the SSE endpoint by default
+so it can show how the algorithm is behaving: effort preset, optional overrides,
+cache hits, current sampler phase, active/finished state counts, best score,
+generated product, stack tokens, building blocks, RDKit validation status, and
+the concrete forward reaction SMILES for each step. It also builds a chained
+multistep reaction SMILES and sends it to `mol2txt.app` for visualization.
+
+Environment variables:
+
+- `REASYN_AUTH_TOKEN`: bearer token for the deployed Modal endpoint. If unset,
+  the UI also checks `/tmp/reasyn_web_auth_token`.
+- `REASYN_MODAL_ENDPOINT`: Modal endpoint URL. Defaults to the deployed example
+  endpoint used during development.
+- `REASYN_MODAL_STREAM_ENDPOINT`: Modal SSE endpoint URL. Defaults to the
+  deployed example stream endpoint used during development.
+- `REASYN_RENDERER_ENDPOINT`: molecule/reaction renderer. Defaults to
+  `http://mol2txt.app/`.
 
 ## Data Preparation
 

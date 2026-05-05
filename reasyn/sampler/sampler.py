@@ -13,15 +13,17 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-import re
 import copy
-from collections.abc import Iterable
+import re
+from collections.abc import Callable, Iterable
 from functools import cached_property
 from multiprocessing.synchronize import Lock
-import pandas as pd
+from typing import Any
+
 import torch
 import torch.nn.functional as F
 import numpy as np
+import pandas as pd
 
 from reasyn.chem.fpindex import FingerprintIndex
 from reasyn.chem.matrix import ReactantReactionMatrix
@@ -36,6 +38,7 @@ from reasyn.utils.sample_utils import get_reactants, get_reactions, \
 
 
 RXN_PATTERN = re.compile('R\d+')
+ProgressCallback = Callable[[dict[str, Any]], None]
 
 
 class Sampler:
@@ -116,24 +119,57 @@ class Sampler:
         num_cycles: int = 1,
         num_editflow_samples: int = 10,
         num_editflow_steps: int = 100,
+        progress_callback: ProgressCallback | None = None,
     ) -> None:
+        self._emit_progress(
+            progress_callback,
+            "search_started",
+            num_cycles=num_cycles,
+            max_evolve_steps=max_evolve_steps,
+            num_editflow_samples=num_editflow_samples,
+            num_editflow_steps=num_editflow_steps,
+        )
         for i in range(num_cycles * 3):
             if time_limit is not None and time_limit.exceeded():
+                self._emit_progress(progress_callback, "time_limit_exceeded", iteration=i + 1)
                 break
 
             if self.exact_break:
                 max_sim = max([state.score for state in self._finished] or [-1])
                 if max_sim == 1.0:
+                    self._emit_progress(progress_callback, "exact_match_found", iteration=i + 1)
                     break
 
             self._finished.sort(key=lambda s: s.score, reverse=True)
             
             if i % 3 == 2:  # EF
+                self._emit_progress(
+                    progress_callback,
+                    "phase_started",
+                    iteration=i + 1,
+                    cycle=i // 3 + 1,
+                    phase="editflow",
+                )
                 if self._finished:
                     self._evolve_editflow(gpu_lock=gpu_lock, num_samples=num_editflow_samples)
+                self._emit_progress(
+                    progress_callback,
+                    "phase_completed",
+                    iteration=i + 1,
+                    cycle=i // 3 + 1,
+                    phase="editflow",
+                )
 
             else:    # use BU and TD AR models alternatively
                 sampling_direction = 'bu' if i % 3 == 0 else 'td'
+                phase = "autoregressive_bottom_up" if sampling_direction == "bu" else "autoregressive_top_down"
+                self._emit_progress(
+                    progress_callback,
+                    "phase_started",
+                    iteration=i + 1,
+                    cycle=i // 3 + 1,
+                    phase=phase,
+                )
                 
                 if self._finished:
                     finished = [state for state in self._finished if state.stack.count_reactions()] # at least one reaction
@@ -148,16 +184,81 @@ class Sampler:
                             sub_stack = get_sub_stacks(stack=stack_to_repredict,
                                                        num_samples=1, topdown=sampling_direction == 'td')[0]
                             self._active.append(State(sub_stack))
+                        self._emit_progress(
+                            progress_callback,
+                            "active_states_resampled",
+                            iteration=i + 1,
+                            cycle=i // 3 + 1,
+                            phase=phase,
+                        )
                     
-                for _ in range(max_evolve_steps):
+                for step in range(max_evolve_steps):
                     self._evolve_ar_singlestep(gpu_lock=gpu_lock, time_limit=time_limit,
                                                sampling_direction=sampling_direction)
+                    self._emit_progress(
+                        progress_callback,
+                        "ar_step_completed",
+                        iteration=i + 1,
+                        cycle=i // 3 + 1,
+                        phase=phase,
+                        step=step + 1,
+                    )
                     if self.exact_break:
                         max_sim = max([state.score for state in self._finished] or [-1])
                         if max_sim == 1.0:
+                            self._emit_progress(
+                                progress_callback,
+                                "exact_match_found",
+                                iteration=i + 1,
+                                cycle=i // 3 + 1,
+                                phase=phase,
+                                step=step + 1,
+                            )
                             break
+                self._emit_progress(
+                    progress_callback,
+                    "phase_completed",
+                    iteration=i + 1,
+                    cycle=i // 3 + 1,
+                    phase=phase,
+                )
             
             self._finished.sort(key=lambda s: s.score, reverse=True)
+        self._emit_progress(progress_callback, "search_completed")
+
+    def _emit_progress(
+        self,
+        callback: ProgressCallback | None,
+        event: str,
+        **extra: Any,
+    ) -> None:
+        if callback is None:
+            return
+
+        best = self._best_finished_state()
+        payload: dict[str, Any] = {
+            "event": event,
+            "active_states": len(self._active),
+            "finished_states": len(self._finished),
+            "aborted_states": len(self._aborted),
+            "best_score": self._state_score(best) if best is not None else None,
+            "best_synthesis": best.stack.get_action_string() if best is not None else None,
+            "best_num_steps": best.stack.count_reactions() if best is not None else None,
+            **extra,
+        }
+        callback(payload)
+
+    def _best_finished_state(self) -> State | None:
+        if not self._finished:
+            return None
+        return max(self._finished, key=lambda state: self._state_score(state))
+
+    @staticmethod
+    def _state_score(state: State) -> float:
+        score = state.score
+        if hasattr(score, "item"):
+            return float(score.item())
+        return float(score)
             
     @torch.no_grad()
     def _predict_ar(

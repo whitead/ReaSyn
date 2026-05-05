@@ -1,14 +1,19 @@
 from __future__ import annotations
 
 import hmac
+import json
 import os
 import pathlib
+import queue
 import shutil
+import threading
 import time
+from collections.abc import Callable
 from typing import Any, Literal
 
 import modal
 from fastapi import Header, HTTPException, status
+from fastapi.responses import StreamingResponse
 from pydantic import BaseModel, ConfigDict, Field
 
 
@@ -58,6 +63,17 @@ EFFORT_PRESETS: dict[Effort, dict[str, int]] = {
 }
 
 
+class SearchOverrides(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    search_width: int | None = Field(default=None, ge=1, le=64)
+    exhaustiveness: int | None = Field(default=None, ge=1, le=256)
+    num_cycles: int | None = Field(default=None, ge=1, le=12)
+    num_editflow_samples: int | None = Field(default=None, ge=1, le=100)
+    num_editflow_steps: int | None = Field(default=None, ge=1, le=200)
+    time_limit: int | None = Field(default=None, ge=0, le=1800)
+
+
 class RoutesRequest(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
@@ -65,6 +81,7 @@ class RoutesRequest(BaseModel):
     k: int = Field(default=10, ge=1, le=100)
     effort: Effort = "medium"
     verbose: bool = False
+    overrides: SearchOverrides | None = None
 
 
 class MoleculeRoutes(BaseModel):
@@ -133,16 +150,57 @@ def _compact_routes(routes: list[dict[str, Any]]) -> list[list[str]]:
     return [route["reaction_smiles"] for route in routes]
 
 
-@app.cls(
-    image=worker_image,
-    gpu="A10G",
-    timeout=60 * 60,
-    scaledown_window=5 * 60,
-    volumes={"/vol": volume.read_only()},
-)
-class ReaSynService:
-    @modal.enter()
-    def load(self) -> None:
+def _sse(event: dict[str, Any]) -> str:
+    event_name = str(event.get("event", "message"))
+    data = json.dumps(event, separators=(",", ":"))
+    return f"event: {event_name}\ndata: {data}\n\n"
+
+
+def _effective_search(request: RoutesRequest) -> dict[str, int]:
+    preset = EFFORT_PRESETS[request.effort].copy()
+    if request.overrides is None:
+        return preset
+
+    for key, value in request.overrides.model_dump(exclude_none=True).items():
+        preset[key] = value
+    return preset
+
+
+def _route_cache_key(smiles: str, request: RoutesRequest) -> tuple[Any, ...]:
+    effective_search = _effective_search(request)
+    return (
+        smiles,
+        request.k,
+        request.effort,
+        tuple(sorted(effective_search.items())),
+    )
+
+
+def _synthesis_tokens(synthesis: str) -> list[str]:
+    return [token.strip() for token in synthesis.split(";") if token.strip()]
+
+
+def _building_blocks(synthesis: str) -> list[str]:
+    return [token for token in _synthesis_tokens(synthesis) if not token.startswith("R")]
+
+
+def _multistep_reaction_smiles(steps: list[dict[str, Any]]) -> str:
+    if not steps:
+        return ""
+
+    chain = steps[0]["reaction_smiles"]
+    previous_product = steps[0]["product"]
+    for step in steps[1:]:
+        extra_reactants = [reactant for reactant in step["reactants"] if reactant != previous_product]
+        if extra_reactants:
+            chain += "." + ".".join(extra_reactants)
+        chain += ">>" + step["product"]
+        previous_product = step["product"]
+    return chain
+
+
+class _ReaSynRuntimeMixin:
+    def _load_engine(self) -> None:
         from reasyn.inference import ReaSynInference
 
         missing = [path for path in (AR_CKPT, EB_CKPT, MCULE_FPINDEX, MCULE_MATRIX) if not path.exists()]
@@ -157,12 +215,38 @@ class ReaSynService:
             rxn_matrix_path=MCULE_MATRIX,
             device="cuda",
         )
-        self._route_cache: dict[tuple[str, int, str], tuple[float, list[dict[str, Any]]]] = {}
+        self._route_cache: dict[tuple[Any, ...], tuple[float, list[dict[str, Any]]]] = {}
 
-    @modal.batched(max_batch_size=BATCH_MAX_REQUESTS, wait_ms=BATCH_WAIT_MS)
-    def sample_many(self, requests: list[dict[str, Any]]) -> list[dict[str, Any]]:
-        self._last_batch_size = len(requests)
-        return [self._sample_payload(request) for request in requests]
+    def _stream_payload(self, request: dict[str, Any]):
+        routes_request = RoutesRequest.model_validate(request)
+        request_started = time.time()
+        yield {
+            "event": "request_started",
+            "input_count": len(routes_request.smiles),
+            "k": routes_request.k,
+            "effort": routes_request.effort,
+            "search": _effective_search(routes_request),
+        }
+
+        results: list[dict[str, Any]] = []
+        for index, smiles in enumerate(routes_request.smiles, start=1):
+            yield {
+                "event": "molecule_started",
+                "input_index": index,
+                "input_count": len(routes_request.smiles),
+                "smiles": smiles,
+                "elapsed_seconds": round(time.time() - request_started, 3),
+            }
+            for event in self._stream_one(smiles, routes_request, index, len(routes_request.smiles)):
+                if event.get("event") in {"molecule_completed", "molecule_failed"} and isinstance(event.get("result"), dict):
+                    results.append(event["result"])
+                yield event
+
+        yield {
+            "event": "request_completed",
+            "elapsed_seconds": round(time.time() - request_started, 3),
+            "result": RoutesResponse.model_validate({"results": results}).model_dump(),
+        }
 
     def _sample_payload(self, request: dict[str, Any]) -> dict[str, Any]:
         routes_request = RoutesRequest.model_validate(request)
@@ -185,26 +269,97 @@ class ReaSynService:
             route["search"]["cache_hit"] = cache_hit
         return MoleculeRoutes(input=smiles, routes=routes)
 
-    def _get_or_sample_routes(self, smiles: str, request: RoutesRequest) -> tuple[list[dict[str, Any]], bool]:
-        cache_key = (smiles, request.k, request.effort)
+    def _stream_one(
+        self,
+        smiles: str,
+        request: RoutesRequest,
+        input_index: int,
+        input_count: int,
+    ):
+        events: queue.Queue[dict[str, Any] | None] = queue.Queue()
+        started = time.time()
+
+        def emit(event: dict[str, Any]) -> None:
+            events.put(
+                {
+                    "input_index": input_index,
+                    "input_count": input_count,
+                    "smiles": smiles,
+                    "elapsed_seconds": round(time.time() - started, 3),
+                    **event,
+                }
+            )
+
+        def run() -> None:
+            try:
+                routes, cache_hit = self._get_or_sample_routes(smiles, request, progress_callback=emit)
+                if not request.verbose:
+                    route_payload: list[Any] = _compact_routes(routes)
+                else:
+                    for route in routes:
+                        route["search"]["cache_hit"] = cache_hit
+                    route_payload = routes
+                emit(
+                    {
+                        "event": "molecule_completed",
+                        "cache_hit": cache_hit,
+                        "result": MoleculeRoutes(input=smiles, routes=route_payload).model_dump(),
+                    }
+                )
+            except Exception as exc:
+                emit(
+                    {
+                        "event": "molecule_failed",
+                        "error": str(exc),
+                        "result": MoleculeRoutes(input=smiles, routes=[], error=str(exc)).model_dump(),
+                    }
+                )
+            finally:
+                events.put(None)
+
+        thread = threading.Thread(target=run, daemon=True)
+        thread.start()
+        while True:
+            event = events.get()
+            if event is None:
+                break
+            yield event
+        thread.join()
+
+    def _get_or_sample_routes(
+        self,
+        smiles: str,
+        request: RoutesRequest,
+        progress_callback: Callable[[dict[str, Any]], None] | None = None,
+    ) -> tuple[list[dict[str, Any]], bool]:
+        cache_key = _route_cache_key(smiles, request)
         now = time.time()
         cached = self._route_cache.get(cache_key)
         if cached is not None:
             expires_at, routes = cached
             if expires_at > now:
+                if progress_callback is not None:
+                    progress_callback({"event": "cache_hit"})
                 return [self._copy_route(route) for route in routes], True
             del self._route_cache[cache_key]
 
-        routes = self._sample_routes(smiles, request)
+        if progress_callback is not None:
+            progress_callback({"event": "cache_miss"})
+        routes = self._sample_routes(smiles, request, progress_callback=progress_callback)
         self._route_cache[cache_key] = (now + CACHE_TTL_SECONDS, [self._copy_route(route) for route in routes])
         if len(self._route_cache) > CACHE_MAX_ITEMS:
             self._evict_expired_or_oldest_cache_entry()
         return routes, False
 
-    def _sample_routes(self, smiles: str, request: RoutesRequest) -> list[dict[str, Any]]:
+    def _sample_routes(
+        self,
+        smiles: str,
+        request: RoutesRequest,
+        progress_callback: Callable[[dict[str, Any]], None] | None = None,
+    ) -> list[dict[str, Any]]:
         from reasyn.validation import validate_route_forward
 
-        preset = EFFORT_PRESETS[request.effort]
+        preset = _effective_search(request)
         df = self.engine.sample(
             smiles,
             search_width=preset["search_width"],
@@ -214,6 +369,7 @@ class ReaSynService:
             num_cycles=preset["num_cycles"],
             num_editflow_samples=preset["num_editflow_samples"],
             num_editflow_steps=preset["num_editflow_steps"],
+            progress_callback=progress_callback,
         )
 
         routes = []
@@ -224,13 +380,29 @@ class ReaSynService:
                 reactions=self.engine.runtime.rxn_matrix.reactions,
             )
             reaction_smiles = [step.reaction_smiles for step in validation.steps]
+            forward_steps = [
+                {
+                    "rxn_id": step.rxn_id,
+                    "reactants": step.reactants,
+                    "product": step.product,
+                    "reaction_smiles": step.reaction_smiles,
+                    "reaction_smarts": step.reaction_smarts,
+                }
+                for step in validation.steps
+            ]
+            synthesis = str(row["synthesis"])
             routes.append(
                 {
                     "rank": rank,
                     "reaction_smiles": reaction_smiles,
+                    "multistep_reaction_smiles": _multistep_reaction_smiles(forward_steps),
+                    "synthesis_tokens": _synthesis_tokens(synthesis),
+                    "building_blocks": _building_blocks(synthesis),
+                    "num_forward_steps": len(forward_steps),
                     "effort": request.effort,
                     "search": {
                         **preset,
+                        "overrides_applied": request.overrides is not None,
                         "modal_request_batch_size": getattr(self, "_last_batch_size", 1),
                         "cache_hit": False,
                         "cache_ttl_seconds": CACHE_TTL_SECONDS,
@@ -239,16 +411,7 @@ class ReaSynService:
                     "forward_valid": validation.valid,
                     "forward_error": validation.error,
                     "forward_candidate_count": validation.final_candidate_count,
-                    "forward_steps": [
-                        {
-                            "rxn_id": step.rxn_id,
-                            "reactants": step.reactants,
-                            "product": step.product,
-                            "reaction_smiles": step.reaction_smiles,
-                            "reaction_smarts": step.reaction_smarts,
-                        }
-                        for step in validation.steps
-                    ],
+                    "forward_steps": forward_steps,
                 }
             )
         return routes
@@ -275,6 +438,41 @@ class ReaSynService:
             else:
                 copied[key] = value
         return copied
+
+
+@app.cls(
+    image=worker_image,
+    gpu="A10G",
+    timeout=60 * 60,
+    scaledown_window=5 * 60,
+    volumes={"/vol": volume.read_only()},
+)
+class ReaSynService(_ReaSynRuntimeMixin):
+    @modal.enter()
+    def load(self) -> None:
+        self._load_engine()
+
+    @modal.batched(max_batch_size=BATCH_MAX_REQUESTS, wait_ms=BATCH_WAIT_MS)
+    def sample_many(self, requests: list[dict[str, Any]]) -> list[dict[str, Any]]:
+        self._last_batch_size = len(requests)
+        return [self._sample_payload(request) for request in requests]
+
+
+@app.cls(
+    image=worker_image,
+    gpu="A10G",
+    timeout=60 * 60,
+    scaledown_window=5 * 60,
+    volumes={"/vol": volume.read_only()},
+)
+class ReaSynStreamService(_ReaSynRuntimeMixin):
+    @modal.enter()
+    def load(self) -> None:
+        self._load_engine()
+
+    @modal.method()
+    def sample_stream(self, request: dict[str, Any]):
+        yield from self._stream_payload(request)
 
 
 @app.function(
@@ -312,6 +510,23 @@ def hydrate_checkpoints() -> list[str]:
 def routes(request: RoutesRequest, authorization: str | None = Header(default=None)) -> RoutesResponse:
     _require_auth(authorization)
     return RoutesResponse.model_validate(ReaSynService().sample_many.remote(request.model_dump()))
+
+
+@app.function(
+    image=web_image,
+    timeout=60 * 60,
+    secrets=[modal.Secret.from_name(AUTH_SECRET_NAME)],
+)
+@modal.fastapi_endpoint(method="POST", label="reasyn-routes-stream", docs=True)
+def routes_stream(request: RoutesRequest, authorization: str | None = Header(default=None)) -> StreamingResponse:
+    _require_auth(authorization)
+
+    def events():
+        yield _sse({"event": "stream_connected"})
+        for event in ReaSynStreamService().sample_stream.remote_gen(request.model_dump()):
+            yield _sse(event)
+
+    return StreamingResponse(events(), media_type="text/event-stream")
 
 
 @app.local_entrypoint()
