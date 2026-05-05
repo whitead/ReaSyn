@@ -415,6 +415,14 @@ HTML = r"""<!doctype html>
       color: var(--muted);
     }
     .template-list b { color: var(--moss); }
+    .annotation {
+      display: grid;
+      gap: 6px;
+      padding: 10px;
+      border-radius: 14px;
+      background: rgba(216, 162, 74, 0.14);
+      border: 1px solid rgba(216, 162, 74, 0.24);
+    }
     .note {
       color: var(--muted);
       font-size: 12px;
@@ -610,10 +618,25 @@ CC(=O)Oc1ccccc1C(=O)O</textarea>
       return `<div><b>${escapeHtml(label)}:</b> ${values.map((value) => `<code>${escapeHtml(value)}</code>`).join(" | ")}</div>`;
     }
 
+    function renderAnnotation(annotation) {
+      if (!annotation) return "";
+      const confidence = annotation.annotation_confidence === null || annotation.annotation_confidence === undefined
+        ? "n/a"
+        : Number(annotation.annotation_confidence).toFixed(3);
+      return `
+        <div class="annotation">
+          <div><b>Annotated reaction:</b> ${escapeHtml(annotation.reaction_name)} <code>${escapeHtml(annotation.reaction_class_id)}</code></div>
+          <div><b>Method/confidence:</b> ${escapeHtml(annotation.annotation_method)} / ${escapeHtml(confidence)}</div>
+          <div><b>Annotation example:</b> <code>${escapeHtml((annotation.example_reactants || []).join(" . "))}</code> -> <code>${escapeHtml(annotation.example_product)}</code></div>
+        </div>`;
+    }
+
     function renderStepDetails(step) {
       const reaction = step.reaction || {};
+      const annotation = reaction.annotation || null;
       return `
         <div class="step-summary">
+          ${renderAnnotation(annotation)}
           <div><b>Actual reactants:</b> <code>${escapeHtml((step.reactants || []).join(" . "))}</code></div>
           <div><b>Actual product:</b> <code>${escapeHtml(step.product)}</code></div>
         </div>

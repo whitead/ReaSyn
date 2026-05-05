@@ -27,6 +27,7 @@ AR_CKPT = ASSET_DIR / "data/trained_model/nv-reasyn-ar-166m-v2.ckpt"
 EB_CKPT = ASSET_DIR / "data/trained_model/nv-reasyn-eb-174m-v2.ckpt"
 MCULE_FPINDEX = ASSET_DIR / "data/processed/mcule_2048/fpindex.pkl"
 MCULE_MATRIX = ASSET_DIR / "data/processed/mcule_2048/matrix.pkl"
+REACTION_ANNOTATIONS = pathlib.Path("/opt/reasyn/reaction_templates/comprehensive_named.tsv")
 
 BATCH_MAX_REQUESTS = 4
 BATCH_WAIT_MS = 750
@@ -102,6 +103,7 @@ worker_image = (
     .apt_install("libgomp1")
     .uv_sync()
     .uv_pip_install("fastapi[standard]>=0.115,<1")
+    .add_local_file("data/rxn_templates/comprehensive_named.tsv", str(REACTION_ANNOTATIONS), copy=True)
     .add_local_python_source("reasyn")
 )
 
@@ -199,7 +201,7 @@ def _multistep_reaction_smiles(steps: list[dict[str, Any]]) -> str:
     return chain
 
 
-def _reaction_details(reaction: Any) -> dict[str, Any]:
+def _reaction_details(reaction: Any, annotation: Any | None = None) -> dict[str, Any]:
     return {
         "smarts": reaction.smarts,
         "num_reactants": reaction.num_reactants,
@@ -208,11 +210,29 @@ def _reaction_details(reaction: Any) -> dict[str, Any]:
         "reactant_templates": [template.smarts for template in reaction.reactant_templates],
         "agent_templates": [template.smarts for template in reaction.agent_templates],
         "product_templates": [template.smarts for template in reaction.product_templates],
+        "annotation": annotation.model_dump() if annotation is not None else None,
         "metadata_note": (
             "The bundled ReaSyn template set contains SMARTS templates, not named "
             "reagents, catalysts, solvents, or reaction conditions."
         ),
     }
+
+
+def _load_checked_reaction_annotations(reactions: Any) -> dict[int, Any]:
+    from reasyn.reaction_annotations import load_reaction_annotations
+
+    annotations = dict(load_reaction_annotations(REACTION_ANNOTATIONS))
+    mismatches = []
+    for template_id, annotation in annotations.items():
+        if template_id >= len(reactions):
+            mismatches.append(f"R{template_id}: annotation ID is outside runtime reaction list")
+            continue
+        if annotation.template_smarts != reactions[template_id].smarts:
+            mismatches.append(f"R{template_id}: annotation SMARTS does not match runtime template")
+    if mismatches:
+        detail = "; ".join(mismatches[:5])
+        raise ValueError(f"Reaction annotation alignment failed: {detail}")
+    return annotations
 
 
 class _ReaSynRuntimeMixin:
@@ -231,6 +251,7 @@ class _ReaSynRuntimeMixin:
             rxn_matrix_path=MCULE_MATRIX,
             device="cuda",
         )
+        self.reaction_annotations = _load_checked_reaction_annotations(self.engine.runtime.rxn_matrix.reactions)
         self._route_cache: dict[tuple[Any, ...], tuple[float, list[dict[str, Any]]]] = {}
 
     def _stream_payload(self, request: dict[str, Any]):
@@ -403,7 +424,10 @@ class _ReaSynRuntimeMixin:
                     "product": step.product,
                     "reaction_smiles": step.reaction_smiles,
                     "reaction_smarts": step.reaction_smarts,
-                    "reaction": _reaction_details(self.engine.runtime.rxn_matrix.reactions[step.rxn_id]),
+                    "reaction": _reaction_details(
+                        self.engine.runtime.rxn_matrix.reactions[step.rxn_id],
+                        self.reaction_annotations.get(step.rxn_id),
+                    ),
                 }
                 for step in validation.steps
             ]

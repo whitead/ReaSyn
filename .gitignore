@@ -16,3 +16,4 @@ data/processed/**
 data/trained_model/*
 !data/trained_model/.gitignore
 poetry.lock
+comprehensive_named_v2_final.tsv
