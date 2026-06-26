@@ -1,4 +1,5 @@
 *
 !.gitignore
+!README.md
 !source_data/
 !source_data/**

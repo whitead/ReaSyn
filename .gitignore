@@ -5,6 +5,7 @@ logs
 results
 dist/*
 !dist/.gitignore
+!dist/README.md
 !dist/source_data/
 !dist/source_data/**
 *.tab
