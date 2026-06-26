@@ -1,0 +1,4 @@
+*
+!.gitignore
+!source_data/
+!source_data/**

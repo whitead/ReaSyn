@@ -3,7 +3,10 @@ __pycache__
 .DS_Store
 logs
 results
-dist
+dist/*
+!dist/.gitignore
+!dist/source_data/
+!dist/source_data/**
 *.tab
 oracle
 *.ckpt

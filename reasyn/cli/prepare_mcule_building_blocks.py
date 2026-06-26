@@ -23,18 +23,8 @@ def _select_column(df: pd.DataFrame, column: str) -> pd.Series:
     return df.iloc[:, index]
 
 
-@click.command(context_settings={"show_default": True})
-@click.option("--input-csv", type=click.Path(dir_okay=False, path_type=pathlib.Path), default="mcule_unique_bb_instock_library_260130.csv")
-@click.option("--smiles-column", default="5", help="Column name or zero-based index containing SMILES.")
-@click.option("--has-header/--no-header", default=False)
-@click.option("--output-smiles", type=click.Path(dir_okay=False, path_type=pathlib.Path), default="data/building_blocks/building_blocks_mcule.txt")
-@click.option("--output-fpindex", type=click.Path(dir_okay=False, path_type=pathlib.Path), default="data/processed/mcule_2048/fpindex.pkl")
-@click.option("--reaction-path", type=click.Path(dir_okay=False, path_type=pathlib.Path), default="data/rxn_templates/comprehensive.txt")
-@click.option("--output-rxn-matrix", type=click.Path(dir_okay=False, path_type=pathlib.Path), default="data/processed/mcule_2048/matrix.pkl")
-@click.option("--no-fpindex", is_flag=True, help="Only write the canonical SMILES text file.")
-@click.option("--no-rxn-matrix", is_flag=True, help="Skip the reactant/reaction matrix.")
-@click.option("--force", "-f", is_flag=True, help="Overwrite existing outputs.")
-def main(
+def prepare_mcule_building_blocks(
+    *,
     input_csv: pathlib.Path,
     smiles_column: str,
     has_header: bool,
@@ -45,7 +35,7 @@ def main(
     no_fpindex: bool,
     no_rxn_matrix: bool,
     force: bool,
-) -> None:
+) -> dict[str, int | None]:
     if output_smiles.exists() and not force:
         raise click.ClickException(f"{output_smiles} already exists. Pass --force to overwrite.")
     if output_fpindex.exists() and not no_fpindex and not force:
@@ -75,7 +65,12 @@ def main(
     click.echo(f"Wrote {len(molecules)} canonical building blocks to {output_smiles}")
 
     if no_fpindex:
-        return
+        return {
+            "building_blocks": len(molecules),
+            "fpindex_molecules": None,
+            "rxn_matrix_reactants": None,
+            "rxn_matrix_reactions": None,
+        }
 
     output_fpindex.parent.mkdir(parents=True, exist_ok=True)
     fpindex = FingerprintIndex(
@@ -87,7 +82,12 @@ def main(
     click.echo(f"Saved MCule fingerprint index to {output_fpindex}")
 
     if no_rxn_matrix:
-        return
+        return {
+            "building_blocks": len(molecules),
+            "fpindex_molecules": len(fpindex.molecules),
+            "rxn_matrix_reactants": None,
+            "rxn_matrix_reactions": None,
+        }
 
     if not reaction_path.exists():
         raise click.ClickException(f"Reaction template file does not exist: {reaction_path}")
@@ -100,3 +100,46 @@ def main(
     click.echo(f"Number of reactants: {len(matrix.reactants)}")
     click.echo(f"Number of reactions: {len(matrix.reactions)}")
     click.echo(f"Saved MCule reaction matrix to {output_rxn_matrix}")
+    return {
+        "building_blocks": len(molecules),
+        "fpindex_molecules": len(fpindex.molecules),
+        "rxn_matrix_reactants": len(matrix.reactants),
+        "rxn_matrix_reactions": len(matrix.reactions),
+    }
+
+
+@click.command(context_settings={"show_default": True})
+@click.option("--input-csv", type=click.Path(dir_okay=False, path_type=pathlib.Path), default="mcule_unique_bb_instock_library_260130.csv")
+@click.option("--smiles-column", default="5", help="Column name or zero-based index containing SMILES.")
+@click.option("--has-header/--no-header", default=False)
+@click.option("--output-smiles", type=click.Path(dir_okay=False, path_type=pathlib.Path), default="data/building_blocks/building_blocks_mcule.txt")
+@click.option("--output-fpindex", type=click.Path(dir_okay=False, path_type=pathlib.Path), default="data/processed/mcule_2048/fpindex.pkl")
+@click.option("--reaction-path", type=click.Path(dir_okay=False, path_type=pathlib.Path), default="data/rxn_templates/comprehensive.txt")
+@click.option("--output-rxn-matrix", type=click.Path(dir_okay=False, path_type=pathlib.Path), default="data/processed/mcule_2048/matrix.pkl")
+@click.option("--no-fpindex", is_flag=True, help="Only write the canonical SMILES text file.")
+@click.option("--no-rxn-matrix", is_flag=True, help="Skip the reactant/reaction matrix.")
+@click.option("--force", "-f", is_flag=True, help="Overwrite existing outputs.")
+def main(
+    input_csv: pathlib.Path,
+    smiles_column: str,
+    has_header: bool,
+    output_smiles: pathlib.Path,
+    output_fpindex: pathlib.Path,
+    reaction_path: pathlib.Path,
+    output_rxn_matrix: pathlib.Path,
+    no_fpindex: bool,
+    no_rxn_matrix: bool,
+    force: bool,
+) -> None:
+    prepare_mcule_building_blocks(
+        input_csv=input_csv,
+        smiles_column=smiles_column,
+        has_header=has_header,
+        output_smiles=output_smiles,
+        output_fpindex=output_fpindex,
+        reaction_path=reaction_path,
+        output_rxn_matrix=output_rxn_matrix,
+        no_fpindex=no_fpindex,
+        no_rxn_matrix=no_rxn_matrix,
+        force=force,
+    )

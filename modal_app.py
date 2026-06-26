@@ -8,6 +8,7 @@ import queue
 import shutil
 import threading
 import time
+import urllib.request
 from collections.abc import Callable
 from typing import Any, Literal
 
@@ -21,13 +22,21 @@ APP_NAME = "reasyn"
 VOLUME_NAME = "reasyn-assets"
 AUTH_SECRET_NAME = "reasyn-web-auth"
 AUTH_ENV_VAR = "REASYN_AUTH_TOKEN"
+SOURCE_DATA_BASE_URL_ENV_VAR = "REASYN_SOURCE_DATA_BASE_URL"
+DEFAULT_SOURCE_DATA_BASE_URL = "https://raw.githubusercontent.com/whitead/ReaSyn/reasyn_v2/dist/source_data"
+MCULE_SOURCE_FILENAME = "mcule_unique_bb_instock_library_260130.csv"
+REACTION_ANNOTATIONS_FILENAME = "comprehensive_named.tsv"
 
 ASSET_DIR = pathlib.Path("/vol/reasyn")
 AR_CKPT = ASSET_DIR / "data/trained_model/nv-reasyn-ar-166m-v2.ckpt"
 EB_CKPT = ASSET_DIR / "data/trained_model/nv-reasyn-eb-174m-v2.ckpt"
+SOURCE_DATA_DIR = ASSET_DIR / "dist/source_data"
+MCULE_SOURCE_CSV = SOURCE_DATA_DIR / MCULE_SOURCE_FILENAME
+REACTION_ANNOTATIONS = SOURCE_DATA_DIR / REACTION_ANNOTATIONS_FILENAME
+MCULE_BUILDING_BLOCKS = ASSET_DIR / "data/building_blocks/building_blocks_mcule.txt"
+REACTION_TEMPLATES = ASSET_DIR / "data/rxn_templates/comprehensive.txt"
 MCULE_FPINDEX = ASSET_DIR / "data/processed/mcule_2048/fpindex.pkl"
 MCULE_MATRIX = ASSET_DIR / "data/processed/mcule_2048/matrix.pkl"
-REACTION_ANNOTATIONS = pathlib.Path("/opt/reasyn/reaction_templates/comprehensive_named.tsv")
 
 BATCH_MAX_REQUESTS = 4
 BATCH_WAIT_MS = 750
@@ -104,14 +113,19 @@ worker_image = (
     .apt_install("libgomp1")
     .uv_sync()
     .uv_pip_install("fastapi[standard]>=0.115,<1")
-    .add_local_file("data/rxn_templates/comprehensive_named.tsv", str(REACTION_ANNOTATIONS), copy=True)
     .add_local_python_source("reasyn")
 )
 
 web_image = modal.Image.debian_slim(python_version="3.10").uv_pip_install("fastapi[standard]>=0.115,<1")
-asset_image = modal.Image.debian_slim(python_version="3.10").uv_pip_install(
-    "fastapi[standard]>=0.115,<1",
-    "huggingface-hub[hf_xet]>=0.36,<1",
+asset_image = (
+    modal.Image.debian_slim(python_version="3.10")
+    .apt_install("libgomp1")
+    .uv_sync()
+    .uv_pip_install(
+        "fastapi[standard]>=0.115,<1",
+        "huggingface-hub[hf_xet]>=0.36,<1",
+    )
+    .add_local_python_source("reasyn")
 )
 
 
@@ -157,6 +171,21 @@ def _sse(event: dict[str, Any]) -> str:
     event_name = str(event.get("event", "message"))
     data = json.dumps(event, separators=(",", ":"))
     return f"event: {event_name}\ndata: {data}\n\n"
+
+
+def _source_data_url(filename: str) -> str:
+    base_url = os.environ.get(SOURCE_DATA_BASE_URL_ENV_VAR, DEFAULT_SOURCE_DATA_BASE_URL)
+    return f"{base_url.rstrip('/')}/{filename}"
+
+
+def _download_file(url: str, target: pathlib.Path) -> str:
+    target.parent.mkdir(parents=True, exist_ok=True)
+    if target.exists():
+        return f"exists: {target}"
+
+    with urllib.request.urlopen(url, timeout=120) as response, target.open("wb") as handle:
+        shutil.copyfileobj(response, handle)
+    return f"downloaded: {url} -> {target}"
 
 
 def _effective_search(request: RoutesRequest) -> dict[str, int]:
@@ -247,7 +276,11 @@ class _ReaSynRuntimeMixin:
     def _load_engine(self) -> None:
         from reasyn.inference import ReaSynInference
 
-        missing = [path for path in (AR_CKPT, EB_CKPT, MCULE_FPINDEX, MCULE_MATRIX) if not path.exists()]
+        missing = [
+            path
+            for path in (AR_CKPT, EB_CKPT, MCULE_FPINDEX, MCULE_MATRIX, REACTION_ANNOTATIONS)
+            if not path.exists()
+        ]
         if missing:
             missing_s = ", ".join(str(path) for path in missing)
             raise FileNotFoundError(f"Missing ReaSyn Modal assets: {missing_s}")
@@ -537,20 +570,79 @@ class ReaSynStreamService(_ReaSynRuntimeMixin):
         yield from self._stream_payload(request)
 
 
+def _write_reaction_templates_from_annotations() -> str:
+    import csv
+
+    if REACTION_TEMPLATES.exists():
+        return f"exists: {REACTION_TEMPLATES}"
+
+    REACTION_TEMPLATES.parent.mkdir(parents=True, exist_ok=True)
+    with REACTION_ANNOTATIONS.open(newline="") as handle:
+        rows = sorted(
+            (
+                int(row["template_id"]),
+                row["template_smarts"].strip(),
+            )
+            for row in csv.DictReader(handle, delimiter="\t")
+        )
+
+    expected_ids = list(range(len(rows)))
+    found_ids = [template_id for template_id, _ in rows]
+    if found_ids != expected_ids:
+        raise ValueError("Reaction annotation template_id values must be contiguous and zero-based.")
+
+    with REACTION_TEMPLATES.open("w") as handle:
+        for _, smarts in rows:
+            handle.write(f"{smarts}\n")
+    return f"generated: {REACTION_TEMPLATES}"
+
+
+def _prepare_mcule_runtime_assets() -> list[str]:
+    if MCULE_BUILDING_BLOCKS.exists() and MCULE_FPINDEX.exists() and MCULE_MATRIX.exists():
+        return [
+            f"exists: {MCULE_BUILDING_BLOCKS}",
+            f"exists: {MCULE_FPINDEX}",
+            f"exists: {MCULE_MATRIX}",
+        ]
+
+    from reasyn.cli.prepare_mcule_building_blocks import prepare_mcule_building_blocks
+
+    stats = prepare_mcule_building_blocks(
+        input_csv=MCULE_SOURCE_CSV,
+        smiles_column="5",
+        has_header=False,
+        output_smiles=MCULE_BUILDING_BLOCKS,
+        output_fpindex=MCULE_FPINDEX,
+        reaction_path=REACTION_TEMPLATES,
+        output_rxn_matrix=MCULE_MATRIX,
+        no_fpindex=False,
+        no_rxn_matrix=False,
+        force=True,
+    )
+    return [
+        f"generated: {MCULE_BUILDING_BLOCKS} ({stats['building_blocks']} building blocks)",
+        f"generated: {MCULE_FPINDEX} ({stats['fpindex_molecules']} molecules)",
+        (
+            f"generated: {MCULE_MATRIX} "
+            f"({stats['rxn_matrix_reactants']} reactants, {stats['rxn_matrix_reactions']} reactions)"
+        ),
+    ]
+
+
 @app.function(
     image=asset_image,
     timeout=6 * 60 * 60,
     volumes={"/vol": volume},
 )
-def hydrate_checkpoints() -> list[str]:
+def hydrate_assets() -> list[str]:
     from huggingface_hub import hf_hub_download
 
-    downloads = [
+    checkpoint_downloads = [
         ("nvidia/NV-ReaSyn-AR-166M-v2", "nv-reasyn-ar-166m-v2.ckpt", AR_CKPT),
         ("nvidia/NV-ReaSyn-EB-174M-v2", "nv-reasyn-eb-174m-v2.ckpt", EB_CKPT),
     ]
     messages = []
-    for repo_id, filename, target in downloads:
+    for repo_id, filename, target in checkpoint_downloads:
         target.parent.mkdir(parents=True, exist_ok=True)
         if target.exists():
             messages.append(f"exists: {target}")
@@ -558,6 +650,11 @@ def hydrate_checkpoints() -> list[str]:
         cached_path = hf_hub_download(repo_id=repo_id, filename=filename)
         shutil.copyfile(cached_path, target)
         messages.append(f"downloaded: {repo_id}/{filename} -> {target}")
+
+    messages.append(_download_file(_source_data_url(MCULE_SOURCE_FILENAME), MCULE_SOURCE_CSV))
+    messages.append(_download_file(_source_data_url(REACTION_ANNOTATIONS_FILENAME), REACTION_ANNOTATIONS))
+    messages.append(_write_reaction_templates_from_annotations())
+    messages.extend(_prepare_mcule_runtime_assets())
 
     volume.commit()
     return messages
@@ -611,5 +708,5 @@ def main(
 
 @app.local_entrypoint()
 def hydrate() -> None:
-    for message in hydrate_checkpoints.remote():
+    for message in hydrate_assets.remote():
         print(message)

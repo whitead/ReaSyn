@@ -205,28 +205,24 @@ uv sync --extra modal
 uv run --extra modal modal setup
 ```
 
-Prepare the MCule runtime assets locally:
-
-```bash
-uv run reasyn-prepare-mcule-building-blocks --force
-```
-
-Create the Modal volume and upload the MCule assets:
+Create the Modal volume:
 
 ```bash
 uv run --extra modal modal volume create reasyn-assets
-uv run --extra modal modal volume put reasyn-assets \
-  data/processed/mcule_2048 \
-  /reasyn/data/processed/mcule_2048 \
-  -f
 ```
 
-Hydrate model checkpoints into the same volume. This downloads the NVIDIA
-ReaSyn checkpoints from Hugging Face inside Modal:
+Hydrate runtime assets into the same volume. This downloads the NVIDIA ReaSyn
+checkpoints from Hugging Face, fetches source data from
+`https://raw.githubusercontent.com/whitead/ReaSyn/reasyn_v2/dist/source_data`,
+and generates the MCule fingerprint index and reaction matrix inside Modal:
 
 ```bash
 uv run --extra modal modal run modal_app.py::hydrate
 ```
+
+Set `REASYN_SOURCE_DATA_BASE_URL` before running `hydrate` to fetch the MCule
+CSV and reaction annotation TSV from another public location with the same file
+names.
 
 Create or rotate the bearer-token secret used by the included endpoint:
 
@@ -350,7 +346,8 @@ def your_stream(payload: dict) -> StreamingResponse:
 
 Keep these constraints in mind when bringing your own server:
 
-- The worker expects assets in Modal volume `reasyn-assets` under `/vol/reasyn`.
+- The worker expects hydrated assets in Modal volume `reasyn-assets` under
+  `/vol/reasyn`; run `modal_app.py::hydrate` after creating the volume.
 - `sample_many` accepts a list of request dictionaries because it is dynamically
   batched by Modal; each dictionary uses the same schema as the HTTP endpoint.
 - Leave batching on the worker side. Your server can send one request per user
